@@ -17,92 +17,25 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Fetch base branch
-        run: git fetch origin ${{ github.base_ref }}:${{ github.base_ref }}
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run PayloadGuard
+      - name: PayloadGuard
         id: payloadguard
-        env:
-          PYTHONUTF8: "1"
-          PR_BODY: ${{ github.event.pull_request.body }}
-          REPORT_PATH: ${{ github.workspace }}/payloadguard-report.md
-        run: |
-          set +e
-          python analyze.py . "${{ github.head_ref }}" "${{ github.base_ref }}" \
-            --pr-description "$PR_BODY" \
-            --save-markdown "$REPORT_PATH"
-          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
-          echo "report_path=$REPORT_PATH" >> "$GITHUB_OUTPUT"
-          ls -lh "$REPORT_PATH" 2>&1 || echo "::warning::Report file not found"
-
-      - name: Post PR comment
-        if: always()
-        uses: actions/github-script@v7
-        env:
-          REPORT_PATH: ${{ steps.payloadguard.outputs.report_path }}
+        uses: DarkVader-PLG/payload-consequence-analyser@main
         with:
-          script: |
-            const fs = require('fs');
-            const marker = '<!-- payloadguard-report -->';
-            const reportPath = process.env.REPORT_PATH;
-
-            let body;
-            try {
-              body = marker + '\n' + fs.readFileSync(reportPath, 'utf8');
-            } catch (e) {
-              body = marker + '\n## ❌ PayloadGuard — Report not generated\n\n`' + String(e) + '`';
-            }
-
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-            });
-
-            const existing = comments.find(c => c.body.startsWith(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.payload.pull_request.number,
-                body,
-              });
-            }
-
-      - name: Post Check Run
-        if: always()
-        env:
-          PAYLOADGUARD_APP_ID: ${{ secrets.PAYLOADGUARD_APP_ID }}
-          PAYLOADGUARD_PRIVATE_KEY: ${{ secrets.PAYLOADGUARD_PRIVATE_KEY }}
-          PAYLOADGUARD_INSTALLATION_ID: ${{ secrets.PAYLOADGUARD_INSTALLATION_ID }}
-          PAYLOADGUARD_EXIT_CODE: ${{ steps.payloadguard.outputs.exit_code }}
-          PAYLOADGUARD_REPORT_PATH: ${{ steps.payloadguard.outputs.report_path }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python post_check_run.py
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-description: ${{ github.event.pull_request.body }}
+          app-id: ${{ secrets.PAYLOADGUARD_APP_ID }}
+          private-key: ${{ secrets.PAYLOADGUARD_PRIVATE_KEY }}
+          installation-id: ${{ secrets.PAYLOADGUARD_INSTALLATION_ID }}
 
       - name: Enforce verdict
         if: always()
+        env:
+          EXIT_CODE: ${{ steps.payloadguard.outputs.exit-code }}
         run: |
-          code="${{ steps.payloadguard.outputs.exit_code }}"
-          if [ "$code" = "1" ]; then
+          if [ "$EXIT_CODE" = "1" ]; then
             echo "::error::PayloadGuard analysis error — check logs"
             exit 1
-          elif [ "$code" = "2" ]; then
+          elif [ "$EXIT_CODE" = "2" ]; then
             echo "::error::PayloadGuard verdict: DESTRUCTIVE — merge blocked"
             exit 2
           fi
