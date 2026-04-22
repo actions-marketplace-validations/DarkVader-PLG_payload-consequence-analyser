@@ -28,14 +28,17 @@ jobs:
       - name: Run PayloadGuard
         id: payloadguard
         env:
+          PYTHONUTF8: "1"
+          PR_BODY: ${{ github.event.pull_request.body }}
           REPORT_PATH: ${{ github.workspace }}/payloadguard-report.md
         run: |
           set +e
           python analyze.py . "${{ github.head_ref }}" "${{ github.base_ref }}" \
-            --pr-description "${{ github.event.pull_request.body }}" \
+            --pr-description "$PR_BODY" \
             --save-markdown "$REPORT_PATH"
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
           echo "report_path=$REPORT_PATH" >> "$GITHUB_OUTPUT"
+          ls -lh "$REPORT_PATH" 2>&1 || echo "::warning::Report file not found"
 
       - name: Post PR comment
         if: always()

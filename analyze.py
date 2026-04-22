@@ -898,11 +898,11 @@ def save_json_report(report, filename="consequence_report.json"):
 
 def save_markdown_report(report, filename="payloadguard-report.md"):
     try:
-        with open(filename, 'w') as f:
+        with open(filename, 'w', encoding='utf-8') as f:
             f.write(format_markdown_report(report))
         print(f"✓ Markdown report saved to {filename}")
     except Exception as e:
-        print(f"⚠️  Could not save markdown report: {e}")
+        print(f"⚠️  Could not save markdown report: {e}", file=sys.stderr)
 
 
 def main():
