@@ -84,6 +84,17 @@ jobs:
               });
             }
 
+      - name: Post Check Run
+        if: always()
+        env:
+          PAYLOADGUARD_APP_ID: ${{ secrets.PAYLOADGUARD_APP_ID }}
+          PAYLOADGUARD_PRIVATE_KEY: ${{ secrets.PAYLOADGUARD_PRIVATE_KEY }}
+          PAYLOADGUARD_INSTALLATION_ID: ${{ secrets.PAYLOADGUARD_INSTALLATION_ID }}
+          PAYLOADGUARD_EXIT_CODE: ${{ steps.payloadguard.outputs.exit_code }}
+          PAYLOADGUARD_REPORT_PATH: ${{ steps.payloadguard.outputs.report_path }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python post_check_run.py
+
       - name: Enforce verdict
         if: always()
         run: |
