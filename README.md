@@ -1,8 +1,10 @@
 # PayloadGuard
 
-**Scans a branch before merge and tells you if it's going to destroy your codebase.**
+Scans a branch before merge and tells you exactly how badly it's going to hurt.
 
-Designed for AI-assisted workflows where a suggestion described as a "minor syntax fix" can silently delete 60 files, 11,967 lines, and your entire test suite.
+Built after watching an AI suggest a *"minor syntax fix"* that would have deleted 60 files, 11,967 lines, and an entire test suite. No one noticed. That's the problem.
+
+> **dev:** [Dark^Vader](https://github.com/DarkVader-PLG)
 
 ---
 
@@ -12,7 +14,7 @@ Designed for AI-assisted workflows where a suggestion described as a "minor synt
 pip install -r requirements.txt
 ```
 
-Requirements: Python 3.8+, GitPython, PyYAML.
+Python 3.8+, GitPython, PyYAML. That's it.
 
 ---
 
@@ -22,27 +24,25 @@ Requirements: Python 3.8+, GitPython, PyYAML.
 python analyze.py <repo_path> <branch> [target]
 ```
 
-**Examples:**
-
 ```bash
 # Basic scan
 python analyze.py . feature-branch main
 
-# Include PR description check (detects deceptive descriptions)
+# Feed it the PR description — catches deceptive payloads
 python analyze.py . feature-branch main --pr-description "minor syntax fix"
 
-# Save a JSON report as well
-python analyze.py . feature-branch main --pr-description "minor syntax fix" --save-json
+# Save a JSON report
+python analyze.py . feature-branch main --save-json
 
-# Save to a specific file
+# Save to a specific path
 python analyze.py . feature-branch main --save-json reports/scan.json
 ```
 
-Run `python analyze.py --help` for full usage.
+`python analyze.py --help` if you need it.
 
 ---
 
-## Output
+## What you get
 
 ```
 ======================================================================
@@ -85,26 +85,24 @@ PAYLOADGUARD ANALYSIS: feature-branch → main
 
 | Verdict | Meaning |
 |---|---|
-| `SAFE` | No significant red flags |
-| `REVIEW` | Minor flags — normal review applies |
-| `CAUTION` | Significant destructive signals |
-| `DESTRUCTIVE` | Do not merge |
+| `SAFE` | Clean |
+| `REVIEW` | Worth a look |
+| `CAUTION` | Something's off |
+| `DESTRUCTIVE` | Walk away |
 
 ---
 
-## Exit Codes
+## Exit codes
 
 | Code | Meaning |
 |---|---|
-| `0` | Safe or review |
-| `1` | Analysis error |
-| `2` | Destructive — use this to block CI |
+| `0` | Fine |
+| `1` | Analysis broke |
+| `2` | Do not merge — wire this to block CI |
 
 ---
 
-## CI Integration
-
-Add this step to your GitHub Actions workflow to block destructive merges automatically:
+## CI
 
 ```yaml
 - name: PayloadGuard
@@ -113,26 +111,26 @@ Add this step to your GitHub Actions workflow to block destructive merges automa
       --pr-description "${{ github.event.pull_request.body }}"
 ```
 
-The job fails (exit code `2`) when the verdict is `DESTRUCTIVE`, blocking the merge.
+Exit `2` fails the job. Merge blocked. Done.
 
 ---
 
 ## Configuration
 
-Drop a `payloadguard.yml` in your repository root to tune thresholds for your team's risk tolerance. All keys are optional — unspecified values fall back to defaults.
+Drop a `payloadguard.yml` in your repo root. Everything is optional — omit what you don't care about and the defaults hold.
 
 ```yaml
 # payloadguard.yml
 thresholds:
-  branch_age_days: [90, 180, 365]     # days at which score increases
-  files_deleted:   [10, 20, 50]       # file counts at which score increases
+  branch_age_days: [90, 180, 365]      # score goes up at each
+  files_deleted:   [10, 20, 50]
   lines_deleted:   [5000, 10000, 50000]
   temporal:
-    stale:     250    # drift score for STALE warning
-    dangerous: 1000   # drift score for DANGEROUS warning
+    stale:     250                      # drift score = age × commits/day
+    dangerous: 1000
   structural:
-    deletion_ratio:    0.20   # fraction of AST nodes deleted to flag CRITICAL
-    min_deleted_nodes: 3      # minimum deletion count before ratio check fires
+    deletion_ratio:    0.20             # fraction of AST nodes deleted
+    min_deleted_nodes: 3               # both must be hit to flag CRITICAL
 
 semantic:
   benign_keywords:
@@ -144,7 +142,7 @@ semantic:
     - small tweak
 ```
 
-**Example — stricter settings for a security-critical repo:**
+Tighten it for anything that matters:
 
 ```yaml
 thresholds:
@@ -161,22 +159,22 @@ semantic:
 
 ---
 
-## How It Works
+## How it works
 
-PayloadGuard runs five layers of analysis on every scan:
+Five layers. Every scan, every time.
 
-| Layer | Name | Question answered |
-|---|---|---|
-| 1 | Surface Scan | How many files and lines change? |
-| 2 | Forensic Analysis | What fraction of the changeset is deletions? |
-| 3 | Consequence Model | What is the combined severity score? |
-| 4 | Structural Drift | Are classes and functions being silently deleted? |
-| 5a | Temporal Drift | Is this branch dangerously out of date? |
-| 5b | Semantic Transparency | Does the PR description match the actual diff? |
+| Layer | What it checks |
+|---|---|
+| 1 — Surface Scan | Files and lines changed |
+| 2 — Forensic Analysis | Deletion ratio, critical path detection |
+| 3 — Consequence Model | Weighted score → final verdict |
+| 4 — Structural Drift | AST diff — which classes and functions actually disappeared |
+| 5a — Temporal Drift | Branch age × repo velocity. Old branch on a fast-moving repo is a different animal than old branch on a slow one |
+| 5b — Semantic Transparency | Does the PR description match what the diff actually does |
 
-### Layer 3 — Consequence Model
+### Scoring (Layer 3)
 
-Produces the final verdict by accumulating a weighted severity score across all signals:
+Points accumulate across signals. No single threshold kills you — it's the pile-up that matters.
 
 | Signal | Thresholds | Points |
 |---|---|---|
@@ -186,27 +184,35 @@ Produces the final verdict by accumulating a weighted severity score across all 
 | Structural severity | CRITICAL | 3 |
 | Lines deleted | > 5k / 10k / 50k | 1 / 2 / 3 |
 
-Score ≥ 5 → `DESTRUCTIVE`. Score 3–4 → `CAUTION`. Score 1–2 → `REVIEW`. Score 0 → `SAFE`.
+`≥ 5` → DESTRUCTIVE. `3–4` → CAUTION. `1–2` → REVIEW. `0` → SAFE.
 
-### Layer 4 — Structural Drift
+### Structural drift (Layer 4)
 
-Parses every modified Python file into an Abstract Syntax Tree and computes the exact set of deleted class and function definitions. Flags `CRITICAL` only when **both** conditions are met — preventing false positives on small utility files:
+Parses modified Python files into ASTs and diffs the named nodes — classes, functions, async functions. Flags CRITICAL only when both conditions land:
 
-- Deletion ratio exceeds `deletion_ratio_threshold` (default 20%)
-- Number of deleted nodes meets `min_deleted_nodes` (default 3)
+- Deletion ratio exceeds threshold (default 20%)
+- Deleted node count hits minimum (default 3)
 
-### Layer 5a — Temporal Drift
+The dual gate stops it crying wolf over small utility files losing one helper.
 
-Computes a compound **Drift Score** = `branch_age_days × target_commits_per_day`. Raw age alone is misleading — a 90-day branch on a slow repo (score 90) is very different from the same branch on a fast-moving repo (score 1800). Verdicts: `CURRENT`, `STALE`, `DANGEROUS`.
+### Temporal drift (Layer 5a)
 
-### Layer 5b — Semantic Transparency
+`Drift Score = branch_age_days × target_commits_per_day`
 
-Compares the PR description against the verified severity verdict. Flags `DECEPTIVE_PAYLOAD` when the description claims low impact ("minor fix", "typo") but the structural verdict is `CRITICAL`. Directly models the April 2026 incident pattern.
+Raw age is a bad metric on its own. 90 days on a repo with 1 commit/week is nothing. 90 days on a repo shipping 20 commits/day is a different problem entirely.
 
-Layer 5 verdicts are advisory — they appear in the report but do not override the main verdict.
+### Semantic transparency (Layer 5b)
+
+Checks whether the PR description matches the actual severity. If someone calls a `CRITICAL`-severity change a "minor fix" or a "typo", that's flagged `DECEPTIVE_PAYLOAD`. Layer 5 verdicts are advisory — they show up in the report but don't override the main verdict.
 
 ---
 
-## Background
+## The incident
 
-In April 2026 a developer received an AI (Codex) suggestion described as a *"minor syntax fix"*. The branch was 10 months old. Had it merged, it would have deleted 60 files, 11,967 lines, 217 tests, and the entire application architecture. PayloadGuard detects every signal that incident produced: the branch age, the deletion ratio, the structural wipeout, and the contradiction between the description and the diff.
+April 2026. A developer got a Codex suggestion: *"minor syntax fix"*. The branch was 10 months old. Nobody looked closely. It would have deleted 60 files, 11,967 lines, 217 tests, and the entire application architecture in one merge.
+
+PayloadGuard catches every signal that produced: the age, the deletion ratio, the structural wipeout, and the gap between what the description claimed and what the diff actually did.
+
+---
+
+*PayloadGuard — because AI doesn't feel bad about what it breaks.*
