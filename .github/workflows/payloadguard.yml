@@ -1,0 +1,54 @@
+name: PayloadGuard
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run PayloadGuard
+        id: payloadguard
+        run: |
+          set +e
+          python analyze.py . "${{ github.head_ref }}" "${{ github.base_ref }}" \
+            --pr-description "${{ github.event.pull_request.body }}" \
+            --save-markdown payloadguard-report.md
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Post PR comment
+        if: always()
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: payloadguard
+          path: payloadguard-report.md
+
+      - name: Enforce verdict
+        if: always()
+        run: |
+          code="${{ steps.payloadguard.outputs.exit_code }}"
+          if [ "$code" = "1" ]; then
+            echo "::error::PayloadGuard analysis error — check logs"
+            exit 1
+          elif [ "$code" = "2" ]; then
+            echo "::error::PayloadGuard verdict: DESTRUCTIVE — merge blocked"
+            exit 2
+          fi
