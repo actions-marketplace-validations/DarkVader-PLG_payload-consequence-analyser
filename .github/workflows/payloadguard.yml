@@ -27,26 +27,32 @@ jobs:
 
       - name: Run PayloadGuard
         id: payloadguard
+        env:
+          REPORT_PATH: ${{ github.workspace }}/payloadguard-report.md
         run: |
           set +e
           python analyze.py . "${{ github.head_ref }}" "${{ github.base_ref }}" \
             --pr-description "${{ github.event.pull_request.body }}" \
-            --save-markdown payloadguard-report.md
+            --save-markdown "$REPORT_PATH"
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          echo "report_path=$REPORT_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Post PR comment
         if: always()
         uses: actions/github-script@v7
+        env:
+          REPORT_PATH: ${{ steps.payloadguard.outputs.report_path }}
         with:
           script: |
             const fs = require('fs');
             const marker = '<!-- payloadguard-report -->';
+            const reportPath = process.env.REPORT_PATH;
 
             let body;
             try {
-              body = marker + '\n' + fs.readFileSync('payloadguard-report.md', 'utf8');
-            } catch {
-              body = marker + '\n## ❌ PayloadGuard — Report not generated\n\nThe analysis did not produce a report file. Check the workflow logs.';
+              body = marker + '\n' + fs.readFileSync(reportPath, 'utf8');
+            } catch (e) {
+              body = marker + '\n## ❌ PayloadGuard — Report not generated\n\n`' + String(e) + '`';
             }
 
             const { data: comments } = await github.rest.issues.listComments({
