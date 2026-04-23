@@ -529,7 +529,28 @@ class TestAnalyzeSuccess(unittest.TestCase):
 
         merge_base_commit = MagicMock()
         merge_base_commit.diff.return_value = diffs
+        merge_base_commit.hexsha = "deadbeef00000000"
         a.repo.merge_base.return_value = [merge_base_commit]
+
+        # Build numstat output from mock diff blobs so line-count tests work.
+        numstat_lines = []
+        for d in diffs:
+            added, deleted = 0, 0
+            path = getattr(d, 'b_path', None) or getattr(d, 'a_path', None) or 'file.py'
+            if d.change_type == 'A':
+                try:
+                    content = d.b_blob.data_stream.read().decode('utf-8', errors='ignore')
+                    added = len(content.splitlines())
+                except Exception:
+                    pass
+            elif d.change_type == 'D':
+                try:
+                    content = d.a_blob.data_stream.read().decode('utf-8', errors='ignore')
+                    deleted = len(content.splitlines())
+                except Exception:
+                    pass
+            numstat_lines.append(f"{added}\t{deleted}\t{path}")
+        a.repo.git.diff.return_value = "\n".join(numstat_lines)
 
         return a
 

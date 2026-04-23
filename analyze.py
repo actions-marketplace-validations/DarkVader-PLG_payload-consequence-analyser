@@ -323,8 +323,11 @@ def load_config(repo_path: str) -> PayloadGuardConfig:
     config_path = Path(repo_path) / "payloadguard.yml"
     if not config_path.exists():
         return PayloadGuardConfig()
-    with open(config_path) as f:
-        user_cfg = yaml.safe_load(f) or {}
+    try:
+        with open(config_path) as f:
+            user_cfg = yaml.safe_load(f) or {}
+    except Exception:
+        return PayloadGuardConfig()
     merged = _deep_merge(DEFAULT_CONFIG, user_cfg)
     return PayloadGuardConfig(
         thresholds=merged.get("thresholds", copy.deepcopy(DEFAULT_CONFIG["thresholds"])),
@@ -415,22 +418,24 @@ class PayloadAnalyzer:
             files_copied   = len([d for d in diffs if d.change_type == 'C'])
             files_typed    = len([d for d in diffs if d.change_type == 'T'])
 
+            # Use git's own numstat for line counts: handles binary files correctly
+            # ('-' entries) and avoids loading blobs into memory.
             lines_added = 0
             lines_deleted = 0
-
-            for d in diffs:
-                if d.change_type == 'A':
-                    try:
-                        content = d.b_blob.data_stream.read().decode('utf-8', errors='ignore')
-                        lines_added += len(content.split('\n'))
-                    except Exception:
-                        pass
-                elif d.change_type == 'D':
-                    try:
-                        content = d.a_blob.data_stream.read().decode('utf-8', errors='ignore')
-                        lines_deleted += len(content.split('\n'))
-                    except Exception:
-                        pass
+            try:
+                numstat = self.repo.git.diff(
+                    '--numstat', merge_base[0].hexsha, branch_ref
+                )
+                for line in numstat.splitlines():
+                    parts = line.split('\t')
+                    if len(parts) == 3:
+                        added_str, deleted_str = parts[0], parts[1]
+                        if added_str != '-':
+                            lines_added += int(added_str)
+                        if deleted_str != '-':
+                            lines_deleted += int(deleted_str)
+            except Exception:
+                pass
 
             # LAYER 4: STRUCTURAL DRIFT
             structural_th = self.config.thresholds["structural"]
@@ -472,7 +477,8 @@ class PayloadAnalyzer:
             target_commit = self.repo.commit(target_ref)
             branch_date = branch_commit.committed_datetime
             target_date = target_commit.committed_datetime
-            days_old = (target_date - branch_date).days
+            # Clamp to zero: branch newer than target is treated as age 0, not an error.
+            days_old = max(0, (target_date - branch_date).days)
 
             total_lines_changed = lines_added + lines_deleted
             deletion_ratio = (lines_deleted / total_lines_changed * 100) if total_lines_changed > 0 else 0
