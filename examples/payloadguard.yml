@@ -1,0 +1,36 @@
+name: PayloadGuard
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: PayloadGuard Scan
+        id: payloadguard
+        uses: darkvader-plg/payload-consequence-analyser@main
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-description: ${{ github.event.pull_request.body }}
+          app-id: ${{ secrets.PAYLOADGUARD_APP_ID }}
+          private-key: ${{ secrets.PAYLOADGUARD_PRIVATE_KEY }}
+          installation-id: ${{ secrets.PAYLOADGUARD_INSTALLATION_ID }}
+
+      - name: Enforce verdict
+        if: always()
+        env:
+          EXIT_CODE: ${{ steps.payloadguard.outputs.exit-code }}
+        run: |
+          if [ "$EXIT_CODE" = "1" ]; then exit 1; fi
+          if [ "$EXIT_CODE" = "2" ]; then exit 2; fi
