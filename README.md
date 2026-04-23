@@ -1,6 +1,18 @@
 # PayloadGuard
 
-Scans a branch before merge and tells you exactly how badly it's going to hurt.
+**PayloadGuard** is a 5-layer branch analysis tool that scans a PR before it merges and produces a forensic verdict on the risk of the changeset.
+
+It checks:
+
+| Layer | What it does |
+|---|---|
+| Surface | Files and lines changed, deletion ratios |
+| Forensic | Weighted risk scoring across all signals |
+| Structural | AST diff — which classes and functions actually disappeared (Python, JS, TS, Go, Rust, Java) |
+| Temporal | Branch age × repo velocity — how stale is the context |
+| Semantic | Does the PR description match what the diff actually does |
+
+Each scan produces a verdict: **SAFE**, **REVIEW**, **CAUTION**, or **DESTRUCTIVE**. In CI it posts a sticky PR comment and a GitHub Check Run. Wire the exit code to a branch protection rule and DESTRUCTIVE verdicts block the merge button automatically.
 
 > **dev:** [Dark^Vader](https://github.com/DarkVader-PLG)
 
