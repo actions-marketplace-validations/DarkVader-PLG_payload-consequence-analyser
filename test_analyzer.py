@@ -330,7 +330,8 @@ class TestAssessConsequenceReview(unittest.TestCase):
         self.assertEqual(v["status"], "REVIEW")
 
     def test_deletion_ratio_over_50(self):
-        v = self.a._assess_consequence(0, 0, 0, 55)
+        # Ratio gate requires >= 100 lines deleted to fire
+        v = self.a._assess_consequence(0, 200, 0, 55)
         self.assertEqual(v["status"], "REVIEW")
 
     def test_5001_lines_deleted(self):
@@ -352,7 +353,8 @@ class TestAssessConsequenceCaution(unittest.TestCase):
         self.assertEqual(v["status"], "CAUTION")
 
     def test_deletion_ratio_over_70_plus_minor_flag(self):
-        v = self.a._assess_consequence(11, 0, 0, 75)
+        # Ratio gate requires >= 100 lines deleted; combine with file flag for CAUTION
+        v = self.a._assess_consequence(11, 200, 0, 75)
         self.assertEqual(v["status"], "CAUTION")
 
     def test_over_10000_lines_plus_old_branch(self):
@@ -491,6 +493,14 @@ class TestAnalyzeErrors(unittest.TestCase):
         result = self.a.analyze()
         self.assertIn("available_branches", result)
 
+    def test_empty_merge_base_returns_error(self):
+        self.a.repo.commit.side_effect = None
+        self.a.repo.commit.return_value = MagicMock()
+        self.a.repo.merge_base.return_value = []
+        result = self.a.analyze()
+        self.assertIn("error", result)
+        self.assertIn("common ancestor", result["error"])
+
 
 # ==============================================================================
 # PayloadAnalyzer — successful analysis
@@ -624,6 +634,34 @@ class TestAnalyzeSuccess(unittest.TestCase):
         result = a.analyze(pr_description="minor syntax fix")
         self.assertIn("semantic", result)
         self.assertIn("status", result["semantic"])
+
+    def test_commit_flags_key_present(self):
+        a = self._setup_repo([self._build_mock_diff("M")])
+        result = a.analyze()
+        self.assertIn("commit_flags", result)
+        self.assertIsInstance(result["commit_flags"], list)
+
+    def test_red_flag_commit_message_detected(self):
+        a = self._setup_repo([self._build_mock_diff("M")])
+        suspicious = MagicMock()
+        suspicious.hexsha = "abcdef1234567"
+        suspicious.message = "remove all tests to simplify CI"
+        a.repo.iter_commits.side_effect = lambda *args, **kwargs: [suspicious]
+        result = a.analyze()
+        self.assertEqual(len(result["commit_flags"]), 1)
+        self.assertEqual(result["commit_flags"][0]["sha"], "abcdef1")
+
+    def test_permission_changes_detected(self):
+        d = self._build_mock_diff("M")
+        d.a_mode = 0o100644  # regular non-executable
+        d.b_mode = 0o100755  # executable
+        d.b_path = "deploy.sh"
+        a = self._setup_repo([d])
+        result = a.analyze()
+        self.assertIn("permission_changes", result)
+        exe = [p for p in result["permission_changes"] if p.get("made_executable")]
+        self.assertEqual(len(exe), 1)
+        self.assertEqual(exe[0]["file"], "deploy.sh")
 
 
 # ==============================================================================
@@ -795,6 +833,47 @@ class TestSaveJsonReport(unittest.TestCase):
     def test_gracefully_handles_write_error(self):
         with patch("builtins.open", side_effect=PermissionError("denied")):
             save_json_report({"x": 1}, "/bad/path.json")
+
+
+# ==============================================================================
+# Module-level constants tracked in structural parser (§1.6)
+# ==============================================================================
+
+class TestStructuralParserConstants(unittest.TestCase):
+    def setUp(self):
+        from structural_parser import extract_named_nodes
+        self.extract = extract_named_nodes
+
+    def test_module_level_assignment_tracked(self):
+        src = "MAX_RETRIES = 5\nTIMEOUT = 30\n"
+        names = self.extract(src, "module.py")
+        self.assertIn("MAX_RETRIES", names)
+        self.assertIn("TIMEOUT", names)
+
+    def test_annotated_assignment_tracked(self):
+        src = "SECRET_KEY: str = 'abc'\n"
+        names = self.extract(src, "config.py")
+        self.assertIn("SECRET_KEY", names)
+
+    def test_functions_still_tracked(self):
+        src = "def foo(): pass\nclass Bar: pass\n"
+        names = self.extract(src, "mod.py")
+        self.assertIn("foo", names)
+        self.assertIn("Bar", names)
+
+    def test_local_variable_not_tracked(self):
+        src = "def foo():\n    x = 1\n    return x\n"
+        names = self.extract(src, "mod.py")
+        self.assertNotIn("x", names)
+        self.assertIn("foo", names)
+
+    def test_deletion_of_constant_detected_by_structural_analyzer(self):
+        original = "SECRET = 'key'\n\ndef process(): pass\n"
+        modified = "def process(): pass\n"
+        result = StructuralPayloadAnalyzer(
+            original, modified, file_path="config.py",
+        ).analyze_structural_drift()
+        self.assertIn("SECRET", result.get("deleted_components", []))
 
 
 # ==============================================================================

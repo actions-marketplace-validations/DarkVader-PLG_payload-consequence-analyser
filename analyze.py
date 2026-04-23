@@ -72,6 +72,19 @@ CRITICAL_PATH_PATTERNS = [
     r"\.(yml|yaml)$",
 ]
 
+# Commit message patterns that indicate deliberate destructive intent.
+# Conservative set — only phrases with low false-positive risk.
+_COMMIT_RED_FLAG_PATTERNS = [
+    r"\bremove\s+all\s+tests?\b",
+    r"\bdelete\s+everything\b",
+    r"\bwipe\s+(out\s+)?(everything|all|codebase)\b",
+    r"\berase\s+(all|everything)\b",
+    r"\bdisable\s+(auth|security|validation|all\s+tests?|checks?)\b",
+    r"\bbypass\s+(auth|security|validation|checks?)\b",
+    r"\bdrop\s+(all\s+)?(tables?|schema|database)\b",
+    r"\bremove\s+(auth|security|authentication|authorization)\b",
+]
+
 
 # ==============================================================================
 # LAYER 4: STRUCTURAL DRIFT DETECTION
@@ -404,7 +417,7 @@ class PayloadAnalyzer:
             target_commit = self.repo.commit(ref)
             since = target_commit.committed_datetime - timedelta(days=90)
             commits = list(
-                self.repo.iter_commits(ref, since=since.isoformat())
+                self.repo.iter_commits(ref, since=since.isoformat(), max_count=1000)
             )
             return round(len(commits) / 90.0, 3)
         except Exception:
@@ -439,6 +452,11 @@ class PayloadAnalyzer:
                 }
 
             merge_base = self.repo.merge_base(target_ref, branch_ref)
+            if not merge_base:
+                return {
+                    "error": "No common ancestor found — branches may have unrelated histories",
+                    "available_branches": [ref.name for ref in self.repo.heads],
+                }
             diffs = merge_base[0].diff(branch_ref)
 
             # LAYER 1: FILE COUNTS
@@ -448,6 +466,33 @@ class PayloadAnalyzer:
             files_renamed  = len([d for d in diffs if d.change_type == 'R'])
             files_copied   = len([d for d in diffs if d.change_type == 'C'])
             files_typed    = len([d for d in diffs if d.change_type == 'T'])
+
+            # Permission change detection (§1.5) and symlink/submodule detection (§1.3).
+            permission_changes = []
+            special_files: list[dict] = []
+            _SYMLINK_MODE    = 0o120000
+            _SUBMODULE_MODE  = 0o160000
+            for d in diffs:
+                try:
+                    a_mode = getattr(d, 'a_mode', None) or 0
+                    b_mode = getattr(d, 'b_mode', None) or 0
+                    fpath  = d.b_path or d.a_path or ''
+                    # Symlinks and submodules — flag regardless of change type.
+                    effective_mode = b_mode or a_mode
+                    if effective_mode & _SUBMODULE_MODE == _SUBMODULE_MODE:
+                        special_files.append({"file": fpath, "type": "submodule", "change_type": d.change_type})
+                    elif effective_mode & _SYMLINK_MODE == _SYMLINK_MODE:
+                        special_files.append({"file": fpath, "type": "symlink", "change_type": d.change_type})
+                    # Mode changes on regular files.
+                    elif a_mode and b_mode and a_mode != b_mode:
+                        permission_changes.append({
+                            "file": fpath,
+                            "from_mode": oct(a_mode),
+                            "to_mode": oct(b_mode),
+                            "made_executable": bool(b_mode & 0o111 and not (a_mode & 0o111)),
+                        })
+                except Exception:
+                    pass
 
             # Use git's own numstat for line counts: handles binary files correctly
             # ('-' entries) and avoids loading blobs into memory.
@@ -548,8 +593,27 @@ class PayloadAnalyzer:
                 benign_keywords=self.config.semantic["benign_keywords"],
             ).analyze_transparency()
 
+            # COMMIT MESSAGE ANALYSIS (advisory — §4.1)
+            commit_flags: list[dict] = []
+            try:
+                branch_commits = list(self.repo.iter_commits(
+                    f"{merge_base[0].hexsha}..{branch_ref}", max_count=50
+                ))
+                for commit in branch_commits:
+                    msg = commit.message.lower()
+                    for pattern in _COMMIT_RED_FLAG_PATTERNS:
+                        if re.search(pattern, msg):
+                            commit_flags.append({
+                                "sha": commit.hexsha[:7],
+                                "message": commit.message.split('\n')[0][:120],
+                                "matched_pattern": pattern,
+                            })
+                            break
+            except Exception:
+                pass
+
             return {
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "analysis": {
                     "branch": self.branch,
                     "target": self.target,
@@ -586,6 +650,9 @@ class PayloadAnalyzer:
                 },
                 "temporal_drift": temporal_drift,
                 "semantic": semantic,
+                "commit_flags": commit_flags,
+                "permission_changes": permission_changes,
+                "special_files": special_files,
                 "deleted_files": {
                     "total": len(deleted_files),
                     "critical": critical_deletions[:10],
@@ -631,16 +698,20 @@ class PayloadAnalyzer:
             flags.append(f"{files_deleted} files would be deleted")
             files_score = 1
 
+        # Ratio scoring only fires when absolute deletions reach a meaningful scale.
+        # A 5-deleted / 15-added PR (25% ratio) is not a destructive changeset.
+        _RATIO_MIN_LINES = 100
         ratio_score = 0
-        if deletion_ratio > 90:
-            flags.append(f"Deletion ratio: {deletion_ratio:.1f}% (almost entire changeset is deletions)")
-            ratio_score = 3
-        elif deletion_ratio > 70:
-            flags.append(f"Deletion ratio: {deletion_ratio:.1f}% (majority of changes are deletions)")
-            ratio_score = 2
-        elif deletion_ratio > 50:
-            flags.append(f"Deletion ratio: {deletion_ratio:.1f}% (more deletions than additions)")
-            ratio_score = 1
+        if lines_deleted >= _RATIO_MIN_LINES:
+            if deletion_ratio > 90:
+                flags.append(f"Deletion ratio: {deletion_ratio:.1f}% (almost entire changeset is deletions)")
+                ratio_score = 3
+            elif deletion_ratio > 70:
+                flags.append(f"Deletion ratio: {deletion_ratio:.1f}% (majority of changes are deletions)")
+                ratio_score = 2
+            elif deletion_ratio > 50:
+                flags.append(f"Deletion ratio: {deletion_ratio:.1f}% (more deletions than additions)")
+                ratio_score = 1
 
         lines_score = 0
         if lines_deleted > lines_th[2]:
@@ -774,6 +845,12 @@ def print_report(report):
             print(f"   Matched keyword: \"{sem['matched_keyword']}\"")
         print(f"   {sem['directive']}")
 
+    commit_flags = report.get('commit_flags', [])
+    if commit_flags:
+        print(f"\n⚠️  COMMIT MESSAGE FLAGS ({len(commit_flags)} suspicious commit(s))")
+        for cf in commit_flags[:5]:
+            print(f"   [{cf['sha']}] {cf['message']}")
+
     print(f"\n🔍 VERDICT: {verdict['status']} [{verdict['severity']}]")
     for flag in verdict['flags']:
         print(f"   ⚠️  {flag}")
@@ -795,6 +872,13 @@ def print_report(report):
             remaining = deleted['total'] - len(deleted['all'])
             if remaining > 0:
                 print(f"      ... and {remaining} more files")
+
+    perm_changes = report.get('permission_changes', [])
+    executable_changes = [p for p in perm_changes if p.get('made_executable')]
+    if executable_changes:
+        print(f"\n🔐 PERMISSION CHANGES ({len(executable_changes)} file(s) made executable)")
+        for p in executable_changes[:5]:
+            print(f"   {p['file']}  {p['from_mode']} → {p['to_mode']}")
 
     print("\n" + "="*70 + "\n")
 
@@ -921,6 +1005,18 @@ def format_markdown_report(report: dict) -> str:
         out.append(f"\n> {sem['directive']}")
         out.append("")
 
+    # Commit message flags
+    commit_flags = report.get('commit_flags', [])
+    if commit_flags:
+        out.append("### ⚠️ Commit Message Flags")
+        out.append(f"**{len(commit_flags)} commit(s) matched red-flag patterns:**")
+        out.append("")
+        out.append("| SHA | Message |")
+        out.append("|---|---|")
+        for cf in commit_flags[:10]:
+            out.append(f"| `{cf['sha']}` | {_md_escape(cf['message'])} |")
+        out.append("")
+
     # Deleted files
     if deleted['total'] > 0:
         out.append(f"### 🗑️ Deleted Files ({deleted['total']} total)")
@@ -943,8 +1039,9 @@ def format_markdown_report(report: dict) -> str:
             out.append("")
 
     out.append("---")
-    ts = report.get('timestamp', '')[:16].replace('T', ' ')
-    out.append(f"_PayloadGuard scan — {ts} UTC_")
+    raw_ts = report.get('timestamp', '')
+    ts = raw_ts[:19].replace('T', ' ') + (' UTC' if '+' not in raw_ts and 'Z' not in raw_ts else '')
+    out.append(f"_PayloadGuard scan — {ts}_")
 
     return "\n".join(out)
 
