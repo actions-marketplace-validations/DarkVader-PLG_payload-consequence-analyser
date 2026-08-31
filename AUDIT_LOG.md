@@ -238,6 +238,252 @@ These items remain open. They are documented here so the next audit run can asse
 
 ---
 
+## Findings Register — Audit Run: 2026-04-24
+
+Conducted by: Claude (claude-sonnet-4-6)
+Trigger: 18-case regression harness — baseline pass rate ~28% at default thresholds
+Fixes applied: 2026-04-24
+
+This run was driven by regression data, not a manual code audit. Root cause analysis on failing test cases exposed five previously uncatalogued detection gaps.
+
+### New Findings (regression-driven)
+
+| ID | Finding | Severity | Status | Commit |
+|---|---|---|---|---|
+| §R1 | L4 structural loop skipped `change_type == 'R'` (renames) — gutted renamed files not AST-diffed | HIGH | **Fixed** | `5cc517f` — condition changed to `in ('M', 'R')` |
+| §R2 | No cross-file structural aggregation — distributed deletions (1 node each from N files) escaped per-file threshold | HIGH | **Fixed** | `5cc517f` — post-loop aggregation: if ≥2 flagged files and sum(deleted_nodes) ≥ min_nodes → CRITICAL |
+| §R3 | Security-critical file deletions (`auth*`, `security*`, `permission*`, `authorization*`) had no dedicated score weight — deletion of `auth.py` masked by addition camouflage | HIGH | **Fixed** | `5cc517f` — `_SECURITY_CRITICAL_PATTERNS` + `security_file_deletions` parameter → +5 |
+| §R4 | `_RATIO_MIN_LINES = 100` floor suppressed ratio scoring on config-only deletions (e.g. 45-line settings.yml at 90% ratio) | MEDIUM | **Fixed** | `5cc517f` — floor drops to 0 when `critical_file_deletions > 0` |
+| §R5 | `database[^/]*\.(py\|js\|ts)` absent from `CRITICAL_PATH_PATTERNS` — database layer deletions scored no critical-path bonus | MEDIUM | **Fixed** | `d36bf88` — pattern added |
+
+### Scoring Model Updates
+
+| ID | Change | Commit |
+|---|---|---|
+| §3.2 (update) | Critical file deletion weight raised +1 → +2 flat (was tiered +1/+2; now always +2) | `5cc517f` |
+| §3.2 (update) | Structural CRITICAL weight raised +3 → +5 — per-case analysis confirmed single-file structural CRITICAL is sufficient for DESTRUCTIVE on its own | `d36bf88` |
+
+### Dashboard Tooling Fixes
+
+| Item | Status | Commit |
+|---|---|---|
+| Pass rate metric aggregated all historical runs (stale code rounds inflating/deflating %) | **Fixed** | `a7cb6b7` — query rewritten to latest run per test case |
+| `simulate_verdict` diverged from `analyze.py` (used old +3/+1/no security scoring) | **Fixed** | `2844ff6` — full rewrite to match current scoring logic |
+| Last Run summary card showed date only, no link to source | **Fixed** | `2a84a35` — full `HH:MM` timestamp, hyperlinked to GitHub Actions run |
+
+### Test Case Metadata Corrections
+
+| ID | Correction | Commit |
+|---|---|---|
+| T09 | `expected_verdict` corrected SAFE → DESTRUCTIVE (database.py deleted; L5b `UNVERIFIED` doesn't suppress a destructive verdict) | `190b0db` |
+| A10 | `expected_verdict` corrected DESTRUCTIVE → SAFE (robustness test — no real deletions, no false positive expected) | `190b0db` |
+
+---
+
+## Summary — 2026-04-24 Run
+
+| Category | New findings | Fixed | Carried open |
+|---|---|---|---|
+| Detection gaps (regression) | 5 | 5 | 0 |
+| Scoring model updates | 2 | 2 | 0 |
+| Dashboard tooling | 3 | 3 | 0 |
+| Test case metadata | 2 | 2 | 0 |
+| **Total** | **12** | **12** | **0** |
+
+**Pass rate after fixes: 17/18 (94%).** Only A06 (adversarial/threshold-gaming) remains undetected — every individual metric tuned just below its threshold. No compound detection exists for this pattern. Documented as a known limitation.
+
+---
+
+## Incident Report — AI Research Tool Context Pollution: 2026-04-24
+
+**Classification:** AI Research Tool Context Pollution — Accidental Source Contamination  
+**Vector:** NotebookLM research session mixing PayloadGuard repo with unrelated external sources; hallucinated output committed to main by repository owner (unintentionally)  
+**Source:** Post-incident analysis by repository owner and code reviewer  
+**Outcome:** Corrupted document landed in main; no commands executed; caught at human review stage
+
+### What Actually Happened
+
+NotebookLM was conducting legitimate research on the PayloadGuard repository. During that session it pulled in external web sources — including the real AE3GIS framework (an MDPI-published ICS security testbed paper), GitHub issue threads, and MCP gateway documentation unrelated to this project. Unable to segregate these sources, it suffered **source contamination**: it began attributing AE3GIS's architecture (Purdue Model, GNS3, SCADA, OpenPLC) to PayloadGuard, producing a report that described this system as if it were an industrial control system testbed.
+
+The repository owner committed one of these corrupted outputs to main, not recognising it as hallucinated content — it was authoritative in tone and plausible in structure. There was no external attacker. The "Track 2 Adversarial Strike" framing in NotebookLM's own post-incident analysis was itself a hallucination — the model rationalised its source contamination error as an external threat rather than its own failure.
+
+### Contamination Chain
+
+```
+NotebookLM research session
+        │  Sources: PayloadGuard repo + AE3GIS paper + GitHub issues
+        │           + MCP gateway docs (unrelated)
+        ▼
+Source contamination — model cannot segregate contexts
+        │  High-entropy academic metadata (Purdue Model, GNS3, SCADA)
+        │  floods context alongside real PayloadGuard details
+        ▼
+Identity hallucination
+        │  PayloadGuard described as ICS testbed with Levels 0–5,
+        │  OpenPLC, ScadaBR, Docker orchestration, physics engine
+        ▼
+Corrupted report produced
+        │  Plausible tone, authoritative structure, wrong system
+        ▼
+Repository owner commits output to main (unintentionally)
+        │  Output appeared legitimate; contamination not yet visible
+        ▼
+PayloadGuard scan — file addition scores 0, no alert raised
+        │
+        ▼
+Human code review — architecture mismatch flagged
+        │  Go codebase, ICS components: none of this exists in PLG
+        ▼
+Contained — no commands executed
+```
+
+### Observable Contamination Artefacts
+
+The corrupted report contained elements from multiple colliding sources:
+
+| Element in corrupted report | Actual origin |
+|---|---|
+| Purdue Model Levels 0–5 | AE3GIS framework paper (MDPI) |
+| GNS3, Docker, OpenPLC, ScadaBR | AE3GIS implementation details |
+| `[citest]`, `needs-ci` triggers | GitHub issue threads pulled into context |
+| `setfacl` permission commands | MCP gateway deployment documentation |
+| `filteredServerCache` memory leak | Real MCP Go SDK GitHub issue (#4038) |
+| Hardware performance table (Mac Studio, MacBook Air) | AE3GIS scalability benchmarks |
+| PayloadGuard test case references | Actual PLG repo content (correctly sourced) |
+
+The contamination was not uniform — real PayloadGuard content (test cases, exit codes, scoring) was mixed with entirely fabricated architecture from other systems.
+
+### What PayloadGuard Did and Did Not Catch
+
+**Caught by human review (not by PayloadGuard):**
+- Architecture mismatch: Go files, `internal/` paths, ICS components — none exist in this Python codebase
+- `[citest commit:<sha>]` pattern identified as a known CI trigger mechanism
+- `setfacl` commands recognised as inappropriate for this system
+- No commands from the document were executed
+
+**Not caught by PayloadGuard (by design — current scope):**
+- L1 Surface Scan: the file was an *addition* (`change_type == 'A'`). PayloadGuard's risk model is deletion-centric. File additions score 0 by default.
+- L2 Forensic: no critical path pattern matches a `.txt` file
+- L4 Structural Drift: plain text has no AST; parser returns nothing
+- L5b Semantic Transparency: direct push to main — no PR context, layer returned `UNVERIFIED`, no flag raised
+- No layer scans the *content* of added files for command injection patterns
+
+### New Findings Identified
+
+| ID | Finding | Severity | Status |
+|---|---|---|---|
+| §INC-1 | Added non-code files not scanned for content — embedded CI trigger strings (`[citest]`, `needs-ci`) are invisible to all layers | HIGH | **Fixed** — `_scan_added_file_content()` in `analyze.py`; 12 tests in `TestAddedFileContentScanning` |
+| §INC-2 | AI research tool source contamination produces outputs functionally identical to deliberate injection — the mechanism is the same regardless of intent | HIGH | Open (out-of-scope for static analysis; mitigated by human review) |
+| §INC-3 | Direct push to main bypasses L5b entirely — `UNVERIFIED` is returned but no flag is raised when there is no PR context at all | MEDIUM | Open |
+| §INC-4 | File additions with no code content score 0 regardless of payload — a 100-line document containing `rm -rf /` or CI trigger strings is indistinguishable from a blank file | HIGH | **Fixed** — same fix as INC-1; added files now score +2 per CI/shell match, capped at +4 |
+
+### Strategic Lessons
+
+**1. AI research tools can hallucinate plausible system identities.**
+NotebookLM didn't produce wrong facts — it produced a wrong *system*. The corrupted report described a coherent, technically detailed ICS testbed that does not exist. The output was authoritative enough that it wasn't immediately rejected. This is a different failure mode from simple factual errors.
+
+**2. The mechanism is functionally identical to deliberate injection — intent is irrelevant to the outcome.**
+Whether a corrupted document enters a repo because an adversary crafted it or because an AI research tool mixed sources, the result is the same: plausible-looking content that doesn't describe reality lands in version control. Defence must treat both cases equivalently.
+
+**3. NotebookLM's post-hoc "attack" classification was itself a hallucination.**
+After the user identified the contamination, NotebookLM reframed its own source contamination error as a deliberate "Track 2 Adversarial Strike." This is significant: AI systems rationalising their own errors as external threats can produce misleading forensic narratives. Incident analysis should not be delegated to the system that caused the incident.
+
+**4. The human review gap is the same in both cases.**
+The output was committed before anyone verified it matched reality. Whether the cause is malicious or accidental, the defence is the same: verify AI-generated content against the actual codebase before committing.
+
+**5. PayloadGuard's structural gaps remain real regardless of cause.**
+§INC-1 and §INC-4 are now fixed. §INC-3 (direct push to main) remains open. The tool can now detect dangerous content in added non-code files; direct pushes to main still produce no escalation signal.
+
+### Proposed Mitigations (Future Work)
+
+| Mitigation | Layer | Notes |
+|---|---|---|
+| Scan content of added `.md`, `.txt`, `.rst`, `.pdf` files for CI trigger patterns | New L1 extension | Pattern list: `\[citest`, `needs-ci`, `citest commit:`, known CI comment triggers |
+| Flag direct pushes to main (no PR context) as elevated risk | L5b extension | Return `NO_PR_CONTEXT` status; raise base severity score by +1 |
+| Content fingerprinting for added non-code files | New L2 extension | Flag files containing shell commands (`sudo`, `setfacl`, `chmod`, `curl`) alongside CI trigger strings |
+| Added to WHITEPAPER §8 (Known Limitations) | Documentation | Document LLM-in-the-loop as an out-of-scope threat model for the current version |
+
+---
+
+## Implementation Findings — eBPF Runtime Agent: 2026-05-27
+
+Discovered during PC smoke test on WSL2 (kernel 6.6.114.1-microsoft-standard-WSL2, Windows 11). Not vulnerabilities — correctness bugs caught before shipping to CI runners.
+
+| ID | Finding | Component | Severity | Status | Commit |
+|---|---|---|---|---|---|
+| §BPF-1 | `rlimit.RemoveMemlock()` called after BPF canary — WSL2 EPERM causes false-negative preflight exit | `agent/preflight.go` + `agent/main.go` | HIGH | **Fixed** | `fe66363` |
+| §BPF-2 | `trace_openat`: `__builtin_memcpy(e->detail, path, sizeof(e->detail))` copies 64 bytes from 32-byte stack buffer — BPF verifier rejects at R10+7 | `agent/bpf/probe.c` | HIGH | **Fixed** | `5465809` |
+| §BPF-3 | `trace_ptrace` filter excluded `PTRACE_TRACEME` (request=0) — self-attach events silently dropped | `agent/bpf/probe.c` | MEDIUM | **Fixed** | `b473bc1` |
+
+### Detail
+
+**§BPF-1:** `preflight()` loads a minimal canary BPF program to detect kernel support. `rlimit.RemoveMemlock()` was called in `main()` after `preflight()` returned. On WSL2, the default memlock rlimit caused `EPERM` on the canary load even though `CONFIG_KPROBES=y`. The agent exited 0 silently, appearing to succeed. Fixed by moving `RemoveMemlock()` into `preflight()` immediately before the canary.
+
+**§BPF-2:** `sizeof(e->detail)` is 64 bytes; `path[32]` is a 32-byte stack buffer. Attempting to copy 64 bytes from a 32-byte source reads 32 bytes past the end of the stack allocation. The BPF verifier on kernel 6.6 flagged this as `invalid read from stack R10 off=7 size=1` (byte 39 of the copy = R10+7). Fixed: `memset` the full 64-byte detail field to zero, then `memcpy` only `sizeof(path)=32` bytes.
+
+**§BPF-3:** The original filter `request != 16 && request != 0x4206` captured `PTRACE_ATTACH` and `PTRACE_SEIZE` but not `PTRACE_TRACEME` (request=0). Smoke test fires `PTRACE_TRACEME`; no `ptrace_attach` events were emitted. Fixed by adding `request != 0` to the early-return guard.
+
+---
+
+## Formal Verification Register — 2026-05-28
+
+**Method:** CrossHair symbolic contract verification + Z3 SMT proofs  
+**Coverage:** L3 Consequence, L4 Structural, L5a Temporal, L5b Semantic  
+**Result:** All contracts hold — exit code 0, no counterexamples
+
+### Verified Properties
+
+| Layer | Module | Contracts | Status |
+|-------|--------|-----------|--------|
+| L3 | `verification/consequence_pure.py` | C1–C12: verdict enum, score bounds [0,31], bijection, safety-critical implications, zero-input guarantee | ✅ Verified |
+| L4 | `verification/structural_pure.py` | S1–S7: dual-gate invariant (DESTRUCTIVE requires BOTH conditions), deletion_ratio ∈ [0,1], empty-input safety | ✅ Verified |
+| L5a | `verification/temporal_pure.py` | T1–T7: drift_score ≥ 0, status bijection, zero-age → CURRENT, zero-velocity → CURRENT | ✅ Verified |
+| L5b | `verification/semantic_pure.py` | M1–M9: mci_score ∈ [0,1], DECEPTIVE ↔ score ≥ 0.5, no-description → UNVERIFIED, TRANSPARENT → score == 0 | ✅ Verified |
+| L3 (Z3) | `tests/proofs/test_z3_properties.py` | P1–P10: monotonicity, structural ordering, score bounds (abstract model) | ✅ Verified |
+
+### Architecture Note
+
+CrossHair cannot symbolically construct `PayloadAnalyzer` because `git.Repo()` runs
+`git --version` as a subprocess during `__init__()`. The solution is pure extraction modules
+in `verification/` — self-contained mirrors of each layer's scoring logic with no external
+dependencies. The sync requirement (documented in `VERIFICATION.md`) ensures these stay
+aligned with production code.
+
+### Not Yet Verified
+
+| Layer | Reason |
+|-------|--------|
+| L1 Surface Scan | Signal collection, not scoring logic |
+| L2/L2b/L2c | Regex matching, YAML parsing, manifest diffing |
+| L5b Phases 1 & 2 | String/regex operations; cannot be symbolically executed |
+| L5c Runtime Agent | eBPF/kernel boundary |
+
+---
+
+## Findings Register — 2026-05-28
+
+### Dafny Phase 4 — Machine-Checked Proofs
+
+Three `.dfy` reference implementations verified with Dafny 4.9.1 + bundled Z3.
+
+| Layer | File | Postconditions | Result |
+|---|---|---|---|
+| L3 Consequence | `verification/dafny/assess_consequence.dfy` | POST-1–12 | **7 verified, 0 errors** |
+| L4 Structural | `verification/dafny/structural_drift.dfy` | S1–S7 | **1 verified, 0 errors** |
+| L5a Temporal | `verification/dafny/temporal_drift.dfy` | T1–T8 | **1 verified, 0 errors** |
+
+CI workflow `verify-dafny.yml` runs on every PR/push touching `verification/dafny/**`.
+
+### RTA02 — Multiline curl credential harvest bypass — CLOSED
+
+| ID | Finding | Severity | Status | Commit |
+|---|---|---|---|---|
+| RTA02 | Multiline curl with `secrets.*` on continuation line evades `credential_harvest` patterns — `[^\n]*` stops at YAML block scalar line boundaries | MEDIUM | **Fixed** | `0bfeb60` — `_normalize_yaml_content()` applied to credential_harvest loop |
+
+Test: `test_multiline_curl_credential_harvest_detected`. Suite: **273 pass, 7 skip**.
+
+---
+
 ## Next Audit Checklist
 
 Copy this section into the next audit issue or branch PR description.

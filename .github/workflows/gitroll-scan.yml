@@ -1,0 +1,14 @@
+name: GitRoll Scan
+on:
+  schedule:
+    - cron: "30 0 * * *"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: GitRoll Scan
+        uses: brenoepics/gitroll-action@7d82ea018bae0e13a90c3f988524325a407df310
+        with:
+          username: 'SDarkVader'

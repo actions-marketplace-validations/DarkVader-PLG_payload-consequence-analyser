@@ -1,239 +1,97 @@
 # PayloadGuard
 
-**PayloadGuard** is a 5-layer branch analysis tool that scans a pull request before it merges and produces a forensic verdict on the risk of the changeset. It was built to stop the class of attack where a destructive diff is hidden behind a harmless-sounding description — and to catch it before a human reviewer has to.
+**Version:** 1.4.0-dev &nbsp;|&nbsp; **Status:** Production &nbsp;|&nbsp; **Released:** May 2026
 
-Each scan produces a verdict: **SAFE**, **REVIEW**, **CAUTION**, or **DESTRUCTIVE**. In CI it posts a GitHub Check Run with a full contextual report. Wire the exit code to a branch protection rule and DESTRUCTIVE verdicts block the merge button automatically.
+[![Dafny Verification](https://github.com/PayloadGuard-PLG/payload-consequence-analyser/actions/workflows/verify-dafny.yml/badge.svg)](https://github.com/PayloadGuard-PLG/payload-consequence-analyser/actions/workflows/verify-dafny.yml)
 
-| Layer | What it checks |
+**Formally verified** — 36 CrossHair contracts · 10 Z3 SMT proofs · 12 Dafny postconditions · 274 tests pass · 3 independent proof methods. → [`PROOFS.md`](PROOFS.md)
+
+PayloadGuard is a GitHub Action that forensically scans pull requests for destructive, deceptive, or malicious code payloads before they reach your main branch.
+
+It was built for the class of attack where a branch held open for months lands as a *"minor fix"* and wipes the codebase in a single merge. Wire it to branch protection and the merge button is blocked automatically — no human review required.
+
+---
+
+## What PayloadGuard Detects
+
+| Threat | Example |
 |---|---|
-| 1 — Surface Scan | Files and lines changed, deletion ratios, binary file handling |
-| 2 — Forensic Analysis | Critical-path file detection, deletion ratios, file permission changes, symlink/submodule detection |
-| 3 — Consequence Model | Weighted scoring across all signals → final verdict |
-| 4 — Structural Drift | AST diff — which named classes, functions, and constants actually disappeared |
-| 5a — Temporal Drift | Branch age × repo velocity — how stale is the context |
-| 5b — Semantic Transparency | Does the PR description match what the diff actually does |
-
-> **dev:** [Dark^Vader](https://github.com/DarkVader-PLG)
-
----
-
-## Contents
-
-- [Install](#install)
-- [Run](#run)
-- [The forensic report](#the-forensic-report)
-- [Exit codes](#exit-codes)
-- [CI](#ci)
-- [GitHub App](#github-app)
-- [Configuration](#configuration)
-- [How it works](#how-it-works)
-- [The incident](#the-incident)
+| Mass deletion disguised as a refactor | 312-day-old branch submitted as *"minor syntax fix"*, deleting 60 files and 11,967 lines |
+| Structural gutting | Authentication layer silently removed function by function across multiple files |
+| Deceptive PR descriptions | Description says *"update config"* — diff deletes the entire security module |
+| Workflow poisoning | Base64 payloads, credential exfiltration, OIDC token theft, dormant triggers |
+| AI tooling config poisoning | Malicious `.claude/settings.json` or `package.json` hook that executes when a developer opens the repo in an AI coding agent or IDE |
+| Supply chain injection | Unverified packages added to manifests under the radar |
+| Typosquatted CI actions | `aws-actions-unofficial/` instead of `aws-actions/` — OIDC token handed to attacker |
 
 ---
 
-## Install
+## Analysis Tiers
 
-```bash
-pip install payloadguard-plg
-```
-
-Or from source:
-
-```bash
-pip install -r requirements.txt
-```
-
-Python 3.8+. Core deps: GitPython, PyYAML, PyJWT, requests. Layer 4 multi-language analysis requires tree-sitter grammar packages (included in `requirements.txt` — omit any you don't need, unsupported file types are skipped silently).
-
----
-
-## Run
-
-```bash
-python analyze.py <repo_path> <branch> [target]
-```
-
-```bash
-# Basic scan
-python analyze.py . feature-branch main
-
-# Feed it the PR description — catches deceptive payloads
-python analyze.py . feature-branch main --pr-description "minor syntax fix"
-
-# Save a JSON report
-python analyze.py . feature-branch main --save-json
-
-# Save a markdown report
-python analyze.py . feature-branch main --save-markdown reports/scan.md
-```
-
-`python analyze.py --help` if you need it.
-
----
-
-## The forensic report
-
-Every scan produces the same structured report. Here's what each section tells you and what to look for.
-
----
-
-### 📅 Temporal
-
-Branch age and the commits being compared. A long-lived branch may have diverged significantly from what the target codebase now looks like.
+PayloadGuard has three tiers of analysis. Each tier is a superset of the one before it. Start with **Core** and add tiers as your threat model requires.
 
 ```
-📅 TEMPORAL
-   Branch age: 14 days
-   Branch: a1b2c3d (2026-04-08)
-   Target:  e4f5g6h (2026-04-22)
-
-Branch is 14 days old — context is fresh.
+┌─────────────────────────────────────────────────────────────┐
+│  CORE  (L1 · L2 · L3)                                       │
+│  Surface scan → Forensic analysis → Verdict                 │
+│  Dependency: GitPython only                                 │
+├─────────────────────────────────────────────────────────────┤
+│  STANDARD  (adds L2c · L2d · L4 · L5a · L5b)               │
+│  + Workflow poisoning · AI config poisoning                 │
+│  + Structural drift · Temporal drift · Semantic transparency│
+│  Dependency: adds tree-sitter grammars                      │
+├─────────────────────────────────────────────────────────────┤
+│  FULL  (adds L5c)                                           │
+│  + eBPF runtime agent — blocks exfiltration on the runner   │
+│  Dependency: adds Linux BPF support                         │
+└─────────────────────────────────────────────────────────────┘
 ```
 
----
+### Core — L1, L2, L3
 
-### 📁 File changes
+The minimum viable deployment. Catches bulk deletion attacks, critical-path file removal, suspicious added files, and unverified dependency injection. No additional system dependencies beyond GitPython.
 
-Raw scope of the changeset — files added, deleted, modified. Deletions are the number to watch. A PR that adds 2 files and deletes 40 is not a normal PR.
-
-```
-📁 FILE CHANGES
-   Added:      3
-   Deleted:    1
-   Modified:   5
-   Total:      9
-
-1 file(s) deleted — within normal range (flag threshold: >10).
-```
-
----
-
-### 📝 Line changes
-
-Volume and direction of change. Deletion ratio measures what fraction of total churn is removal. Above 50% starts raising flags; above 90% means almost everything this PR touches is being taken away.
-
-> **Note:** The deletion ratio gate only fires when at least 100 lines are deleted. A 5-deleted/15-added PR won't be flagged on ratio alone — absolute scale matters.
-
-```
-📝 LINE CHANGES
-   Added:        420 lines
-   Deleted:       18 lines
-   Net:          +402 lines
-   Deletion ratio: 4.1%
-
-4.1% of total churn is deletion — within normal range (flag threshold: >50%).
-```
-
----
-
-### 🧬 Structural drift — Layer 4
-
-Parses every modified source file and computes exactly which named classes, functions, and constants disappeared. This is the layer that catches a file being "modified" when it's actually been gutted — line diffs alone won't tell you that `AuthManager` and `SessionStore` no longer exist.
-
-Flags `CRITICAL` only when both conditions are met: deletion ratio exceeds the threshold **and** enough nodes were deleted. The dual gate prevents noise from small utility files.
-
-**Supported languages:** Python · JavaScript · TypeScript · Go · Rust · Java (`.py .js .jsx .ts .tsx .go .rs .java`). Python uses stdlib AST. All others use tree-sitter. Files for grammars not installed are skipped silently.
-
-**Python tracking includes:** named functions, classes, async functions, module-level assignments (`MAX_RETRIES = 5`), and annotated assignments (`SECRET_KEY: str = "..."`).
-
-**Rust tracking includes:** functions, structs, enums, traits, `const` items, `static` items.
-
-**Go tracking includes:** functions, methods, type specs, `const` specs.
-
-```
-🧬 STRUCTURAL DRIFT (Layer 4)
-   Overall severity: CRITICAL
-   src/core/auth.py: 8 nodes deleted (80.0%) [CRITICAL]
-      - AuthManager
-      - SessionStore
-      - TokenValidator
-      - SECRET_KEY
-
-No significant class, function, or constant deletions detected — file content is structurally intact.
-```
-
----
-
-### ⏱ Temporal drift — Layer 5a
-
-Compound score: `branch_age_days × target_commits_per_day`. Raw age alone is a weak signal — a 90-day branch on a slow repo is nothing; on a fast repo it's a serious semantic gap.
-
-| Status | Drift Score | Meaning |
-|---|---|---|
-| `CURRENT` | < 250 | Branch context is valid |
-| `STALE` | 250 – 999 | Moderate drift — manual diff review |
-| `DANGEROUS` | ≥ 1000 | Rebase required before this goes anywhere near main |
-
-```
-⏱  TEMPORAL DRIFT (Layer 5a)
-   Status: CURRENT [LOW]
-   Drift Score: 14.0  (CURRENT <250 · STALE 250–1,000 · DANGEROUS ≥1,000)
-   Target velocity: 1.0 commits/day
-   ✓ SAFE. Branch context is synchronized with target.
-```
-
----
-
-### 🔎 Semantic transparency — Layer 5b
-
-Compares the PR description against the verified severity. If the description uses low-impact language ("minor fix", "typo", "cleanup") but the structural verdict is `CRITICAL`, that's a `DECEPTIVE_PAYLOAD`. Advisory signal — doesn't override the main verdict, but it shows up clearly.
-
-| Status | Meaning |
+| Layer | What it does |
 |---|---|
-| `TRANSPARENT` | Description matches what the diff actually does |
-| `UNVERIFIED` | No description provided |
-| `DECEPTIVE_PAYLOAD` | Description claims low impact, diff says otherwise |
+| **L1 — Surface Scan** | File and line counts, deletion ratios, binary files, permission changes, symlinks |
+| **L2 — Forensic Analysis** | Critical-path deletions, security-sensitive file removal, added file content (shell patterns, CI triggers) |
+| **L2b — SCA** | Package manifest diffs scanned against your allowlist for unverified dependencies |
+| **L3 — Consequence Model** | Weighted scoring across all signals → single deterministic verdict |
 
----
+**Verdict:** SAFE · REVIEW · CAUTION · DESTRUCTIVE  
+**Exit codes:** `0` = SAFE/REVIEW/CAUTION · `1` = analysis error · `2` = DESTRUCTIVE (merge blocked)
 
-### ⚠️ Commit message flags
+### Standard — adds L2c, L4, L5a, L5b
 
-Scans up to 50 commits between the merge base and branch tip for red-flag language: removing all tests, disabling auth, bypassing security checks, dropping a database. Surfaced as advisory — doesn't change the score, but appears prominently in the report.
+Adds four layers that catch sophisticated evasion: workflow-based attacks, structural gutting distributed across files, stale branches from slow-burn campaigns, and PRs with descriptions designed to mislead reviewers.
 
----
-
-### 🔐 Permission changes
-
-Detects files whose mode changed — specifically files that were made executable without any content change. A script silently gaining execute permission is a supply-chain signal.
-
----
-
-### 🔍 Verdict
-
-The final call. Produced by the consequence model (Layer 3) which accumulates a weighted score across all signals.
-
-| Verdict | Severity | Score | Meaning |
-|---|---|---|---|
-| `SAFE` | LOW | 0 | Nothing notable. Proceed. |
-| `REVIEW` | MEDIUM | 1–2 | Minor flags. Worth a look but not alarming. |
-| `CAUTION` | HIGH | 3–4 | Real signals. Needs proper review before merge. |
-| `DESTRUCTIVE` | CRITICAL | ≥ 5 | Stop. Do not merge. |
-
-```
-🔍 VERDICT: SAFE [LOW]
-   ⚠️  No major red flags detected
-
-✉️  RECOMMENDATION:
-   ✓ Proceed with normal review process
-```
-
----
-
-## Exit codes
-
-| Code | Meaning |
+| Layer | What it adds |
 |---|---|
-| `0` | Fine |
-| `1` | Analysis broke |
-| `2` | Do not merge — wire this to block CI |
+| **L2c — Actions Poisoning** | Workflow files scanned for base64 payloads, credential exfiltration, OIDC escalation, forged identities, dormant triggers, unsafe `pull_request_target` |
+| **L2d — AI Config Poisoning** | AI tooling config files scanned for shell commands in session hooks, folder-open tasks, lifecycle scripts, `binding.gyp` shell chains, MCP local server commands, and Cursor NL imperatives — 9 file surfaces |
+| **L4 — Structural Drift** | AST-level diff — which named classes, functions, and constants were deleted, per file and cross-file |
+| **L5a — Temporal Drift** | Branch age × target commit velocity — quantified staleness score to catch slow-burn campaigns |
+| **L5b — Semantic Transparency** | Whether the PR description matches what the diff actually does |
+
+**Additional dependency:** tree-sitter grammar packages (Python, JS/TS, Go, Rust, Java — see `requirements.txt`)
+
+### Full — adds L5c
+
+Adds the eBPF runtime agent to monitor the CI runner itself during a scan. Captures outbound network connections, process execution, ptrace activity, and `/proc/mem` access. Can operate in audit or block mode.
+
+| Layer | What it adds |
+|---|---|
+| **L5c — Runtime Agent** | eBPF tracepoints: execve · egress connect · ptrace · procmem — audit log or block mode |
+
+**Additional dependency:** Linux kernel with BPF support. Requires elevated runner permissions (`SYS_BPF`, `SYS_PTRACE`). See [Runtime Agent setup](#runtime-agent-l5c).
 
 ---
 
-## CI
+## Quick Start
 
-### GitHub Action (recommended)
+### Core (recommended starting point)
 
-Add to `.github/workflows/payloadguard.yml`:
+Add `.github/workflows/payloadguard.yml` to your repository:
 
 ```yaml
 name: PayloadGuard
@@ -254,9 +112,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: PayloadGuard
+      - name: PayloadGuard Scan
         id: payloadguard
-        uses: DarkVader-PLG/payload-consequence-analyser@main
+        uses: PayloadGuard-PLG/payload-consequence-analyser@main
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           pr-description: ${{ github.event.pull_request.body }}
@@ -270,149 +128,96 @@ jobs:
           if [ "$EXIT_CODE" = "2" ]; then exit 2; fi
 ```
 
-With [GitHub App](#github-app) secrets wired up, pass them too:
+Set the `scan` job as a **required status check** in your branch protection rules. DESTRUCTIVE PRs fail the check and cannot be merged.
+
+### Standard (adds workflow + structural analysis)
+
+Same workflow as above — all Standard layers activate automatically when tree-sitter grammars are available. The action installs them via `requirements.txt` on the runner.
+
+To add the PR description for semantic analysis (recommended):
 
 ```yaml
-      - name: PayloadGuard
-        uses: DarkVader-PLG/payload-consequence-analyser@main
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           pr-description: ${{ github.event.pull_request.body }}
-          app-id: ${{ secrets.PAYLOADGUARD_APP_ID }}
-          private-key: ${{ secrets.PAYLOADGUARD_PRIVATE_KEY }}
-          installation-id: ${{ secrets.PAYLOADGUARD_INSTALLATION_ID }}
 ```
 
-Wire a branch protection rule to require the `scan` check and the merge button is blocked on DESTRUCTIVE verdicts.
-
----
-
-## GitHub App
-
-For a named **PayloadGuard** check badge in the PR checks tab (beyond the sticky comment), register a GitHub App and wire it up with three repo secrets:
-
-| Secret | Value |
-|---|---|
-| `PAYLOADGUARD_APP_ID` | Your App ID |
-| `PAYLOADGUARD_PRIVATE_KEY` | Contents of the generated `.pem` private key (RSA PEM format) |
-| `PAYLOADGUARD_INSTALLATION_ID` | Installation ID from `github.com/settings/installations` |
-
-With those set, the workflow calls `post_check_run.py` to post a Check Run after each scan — green for SAFE, red for DESTRUCTIVE, with the full contextual report as the body.
-
-Without the secrets the step is a no-op; the merge blocking still works.
-
----
-
-## Configuration
-
-Drop a `payloadguard.yml` in your repo root. Everything is optional — omit what you don't care about and the defaults hold.
+### Full (adds eBPF runtime agent)
 
 ```yaml
-# payloadguard.yml
-thresholds:
-  branch_age_days: [90, 180, 365]      # score goes up at each tier
-  files_deleted:   [10, 20, 50]
-  lines_deleted:   [5000, 10000, 50000]
-  temporal:
-    stale:     250                      # drift score = age × commits/day
-    dangerous: 1000
-  structural:
-    deletion_ratio:    0.20             # fraction of AST nodes deleted
-    min_deleted_nodes: 3               # both must be hit to flag CRITICAL
+    permissions:
+      contents: read
+      pull-requests: write
 
-semantic:
-  benign_keywords:
-    - minor fix
-    - minor syntax fix
-    - typo
-    - formatting
-    - cleanup
-    - small tweak
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: PayloadGuard Scan
+        id: payloadguard
+        uses: PayloadGuard-PLG/payload-consequence-analyser@main
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-description: ${{ github.event.pull_request.body }}
+        env:
+          PAYLOADGUARD_RUNTIME: "1"
 ```
 
-Threshold lists must be in ascending order — out-of-order values are auto-sorted. Tighten for anything that matters:
+The runtime agent requires a Linux runner with BPF capabilities. See [Runtime Agent setup](#runtime-agent-l5c) for kernel requirements and block-mode configuration.
 
-```yaml
-thresholds:
-  structural:
-    deletion_ratio: 0.10
-    min_deleted_nodes: 2
-semantic:
-  benign_keywords:
-    - minor fix
-    - typo
-    - trivial
-    - nit
+---
+
+## Installation
+
+### From the GitHub Actions Marketplace
+
+Reference `PayloadGuard-PLG/payload-consequence-analyser@main` in your workflow. No local install required.
+
+### Python package
+
+```bash
+pip install payloadguard-plg
+```
+
+### From source
+
+```bash
+git clone https://github.com/PayloadGuard-PLG/payload-consequence-analyser.git
+
+# Core only (GitPython, PyYAML, PyJWT, requests)
+pip install gitpython pyyaml pyjwt requests
+
+# Standard (adds tree-sitter grammars for L4 structural analysis)
+pip install -r requirements.txt
+```
+
+**Python 3.8+** required.
+
+---
+
+## CLI Usage
+
+Scan a branch locally without opening a PR:
+
+```bash
+# Core scan
+python analyze.py . feature/auth-refactor main
+
+# With PR description (enables semantic transparency — L5b)
+python analyze.py . feature/auth-refactor main \
+  --pr-description "Refactor authentication module"
+
+# Save reports
+python analyze.py . feature/auth-refactor main --save-json
+python analyze.py . feature/auth-refactor main --save-markdown reports/scan.md
 ```
 
 ---
 
-## How it works
+## Real Incident Reconstruction
 
-Five layers, every scan, every time.
-
-### Scoring (Layer 3)
-
-Points accumulate across signals. No single threshold kills you — it's the pile-up that matters.
-
-**Branch age**
-
-| Days old | Points |
-|---|---|
-| > 90 | +1 |
-| > 180 | +2 |
-| > 365 | +3 |
-
-**Deletion dimensions (files deleted, deletion ratio, lines deleted)**
-
-These three signals are highly correlated — a large destructive PR will naturally score on all three. To prevent double-counting, they are scored independently and then capped:
-
-```
-deletion_score = min(4, max(files_score, ratio_score, lines_score) + bonus)
-bonus = 1 if at least 2 dimensions are non-zero, else 0
-```
-
-Individual dimension thresholds:
-
-| Signal | Thresholds | Points |
-|---|---|---|
-| Files deleted | > 10 / > 20 / > 50 | 1 / 2 / 3 |
-| Deletion ratio | > 50% / > 70% / > 90% | 1 / 2 / 3 |
-| Lines deleted | > 5k / > 10k / > 50k | 1 / 2 / 3 |
-
-> Deletion ratio only fires when at least 100 lines are deleted.
-
-**Critical path weighting**
-
-Files matching high-value path patterns (tests, CI workflows, auth, schema, migrations, entry points) carry extra weight:
-
-| Critical files deleted | Points |
-|---|---|
-| > 5 | +2 |
-| > 0 | +1 |
-
-**Structural severity**
-
-| Condition | Points |
-|---|---|
-| Layer 4 severity = CRITICAL | +3 |
-
-**Verdict thresholds**
-
-| Score | Verdict |
-|---|---|
-| 0 | SAFE |
-| 1–2 | REVIEW |
-| 3–4 | CAUTION |
-| ≥ 5 | DESTRUCTIVE |
-
----
-
-## The incident
-
-In April 2026, a developer received a Codex suggestion described as a *"minor syntax fix"*. The branch had been open for 10 months. Nobody looked closely enough. It would have deleted 60 files, 11,967 lines, 217 tests, and the entire application architecture in a single merge. That's what this tool was built to stop.
-
-Below is the forensic report PayloadGuard would have produced on that branch.
+This is the verdict PayloadGuard would have produced on the April 2026 incident — a branch open for 312 days, submitted as a *"minor syntax fix"*, containing a diff that deleted 60 files, 11,967 lines, and the entire application architecture.
 
 ```
 ======================================================================
@@ -421,65 +226,257 @@ PAYLOADGUARD ANALYSIS: codex-suggestion → main
 
 📅 TEMPORAL
    Branch age: 312 days
-   Branch: fa3c21d (2025-06-04)
-   Target:  b87e90a (2026-04-22)
+   Branch commit: fa3c21d (2025-06-04)
+   Target commit: b87e90a (2026-04-22)
 
 📁 FILE CHANGES
-   Added:      2
-   Deleted:   61
-   Modified:   4
-   Total:     67
+   Added:       2   Deleted:  61   Modified:   4   Total: 67
 
-   61 files deleted — massive scope (flag threshold: >10 REVIEW · >20 CAUTION · >50 DESTRUCTIVE).
+   61 files deleted — DESTRUCTIVE threshold exceeded (>50).
 
 📝 LINE CHANGES
-   Added:        214 lines
-   Deleted:   11,967 lines
-   Net:       -11,753 lines
+   Added:       214   Deleted: 11,967   Net: -11,753
    Deletion ratio: 98.2%
 
-   98.2% deletion ratio — almost the entire changeset is deletions (threshold: >90% → DESTRUCTIVE).
+   98.2% deletion ratio — almost the entire changeset is removal.
 
 🧬 STRUCTURAL DRIFT (Layer 4)
    Overall severity: CRITICAL
-   Max deletion ratio: 94.0%
    src/core/auth.py: 12 nodes deleted (94.0%) [CRITICAL]
-      - AuthManager
-      - SessionStore
-      - TokenValidator
-      - PermissionGate
-      - RoleRegistry
-
-   Named structural components have been deleted at scale.
+      Removed: AuthManager, SessionStore, TokenValidator,
+               PermissionGate, RoleRegistry
 
 ⏱  TEMPORAL DRIFT (Layer 5a)
-   Status: DANGEROUS [CRITICAL]
-   Drift Score: 3120.0  (CURRENT <250 · STALE 250–1,000 · DANGEROUS ≥1,000)
+   Status: DANGEROUS   Drift score: 3120.0
    Target velocity: 10.0 commits/day
-   ❌ DO NOT MERGE. Extreme semantic drift detected.
 
-🔎 SEMANTIC TRANSPARENCY (Layer 5b)
-   Status: DECEPTIVE_PAYLOAD
-   Matched keyword: "minor syntax fix"
-   ❌ DO NOT MERGE. PR description deliberately contradicts catastrophic
-      architectural changes.
+🔎 SEMANTIC TRANSPARENCY (Layer 5b) — DECEPTIVE_PAYLOAD
+   MCI score: 0.700
+   Signals:   scope_understated, operation_mutation
+   ❌ DO NOT MERGE. PR description is inconsistent with actual diff scope.
 
 🔍 VERDICT: DESTRUCTIVE [CRITICAL]
-   ⚠️  Branch is 312 days old (6+ months)
-   ⚠️  61 files would be deleted (massive scope)
-   ⚠️  Deletion ratio: 98.2% (almost entire changeset is deletions)
-   ⚠️  Structural drift CRITICAL — significant class/function deletions detected
-   ⚠️  11,967 lines would be deleted (large codebase change)
-   ⚠️  5 critical-path files deleted
-
-✉️  RECOMMENDATION:
    ❌ DO NOT MERGE — This would catastrophically alter the codebase
 
+   Flags:
+   ⚠  Branch is 312 days old
+   ⚠  61 files deleted (massive scope)
+   ⚠  98.2% deletion ratio
+   ⚠  Structural drift CRITICAL — core authentication layer removed
+   ⚠  11,967 lines deleted
+   ⚠  5 critical-path files deleted
+   ⚠  Description contradicts actual severity
 ======================================================================
 ```
 
-Every signal was there. The age. The deletion ratio. The structural wipeout. The gap between what the description said and what the diff actually did. Nobody saw it. Now you will.
+Every signal was present and quantifiable before the merge button was pressed.
 
 ---
 
-*PayloadGuard — because AI doesn't feel bad about what it breaks.*
+## GitHub App (optional — named check runs)
+
+Without GitHub App secrets the scan still runs and the verdict is enforced via exit code. The App is only needed to post a named **PayloadGuard** check in the PR checks tab.
+
+Register a GitHub App and add three secrets to your repo:
+
+| Secret | Value |
+|---|---|
+| `PAYLOADGUARD_APP_ID` | App ID from GitHub App settings |
+| `PAYLOADGUARD_PRIVATE_KEY` | RSA private key (PEM format) |
+| `PAYLOADGUARD_INSTALLATION_ID` | Installation ID from `github.com/settings/installations` |
+
+```yaml
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-description: ${{ github.event.pull_request.body }}
+          app-id: ${{ secrets.PAYLOADGUARD_APP_ID }}
+          private-key: ${{ secrets.PAYLOADGUARD_PRIVATE_KEY }}
+          installation-id: ${{ secrets.PAYLOADGUARD_INSTALLATION_ID }}
+```
+
+---
+
+## Configuration
+
+Place `payloadguard.yml` in your repository root to override defaults. All fields are optional.
+
+```yaml
+thresholds:
+  branch_age_days: [90, 180, 365]    # days → +1/+2/+3 score
+  files_deleted:   [10, 20, 50]      # files → +1/+2/+3 score
+  lines_deleted:   [5000, 10000, 50000]
+  temporal:
+    stale:     250                   # drift_score threshold (STALE)
+    dangerous: 1000                  # drift_score threshold (DANGEROUS)
+  structural:
+    deletion_ratio:    0.20          # 20% of nodes deleted → CRITICAL
+    min_deleted_nodes: 3
+
+sca:
+  fail_on_unknown: true              # unverified package → +3 score
+
+actions:
+  enabled: true
+  critical_signal_score: 5
+  high_signal_score: 3
+  trusted_oidc_consumers:
+    - my-org/custom-deploy-action    # add your own OIDC consumers here
+
+semantic:
+  micro_scope_churn_limit: 50
+  insertion_ratio_fix_threshold: 0.9
+```
+
+### SCA Allowlist (Layer 2b)
+
+Create `allowlist.yml` listing approved packages. Any package in a manifest diff not on the allowlist scores +3.
+
+```yaml
+packages:
+  - requests
+  - numpy
+  - django
+```
+
+---
+
+## Runtime Agent: L5c
+
+The eBPF agent monitors the CI runner itself during execution. It captures four event types:
+
+| Event | What it catches |
+|---|---|
+| `execve` | Unexpected process spawning — shells, interpreters, downloaders |
+| `egress_connect` | Outbound network connections — data exfiltration, C2 callbacks |
+| `ptrace_attach` | Process injection attempts |
+| `procmem_open` | `/proc/<pid>/mem` read access — memory scraping |
+
+**Kernel requirements:** Linux 5.4+ with `CONFIG_BPF=y`, `CONFIG_BPF_SYSCALL=y`. The agent uses BTF type info — kernel must be compiled with `CONFIG_DEBUG_INFO_BTF=y`.
+
+**Audit mode** (default) — events are logged to the JSON report. No blocking.
+
+**Block mode** — set `PAYLOADGUARD_RUNTIME_BLOCK=1`. Detected events send `SIGKILL` to the offending process.
+
+```yaml
+        env:
+          PAYLOADGUARD_RUNTIME: "1"
+          PAYLOADGUARD_RUNTIME_BLOCK: "1"    # optional — block rather than audit
+```
+
+---
+
+## Technical Reference
+
+### Verdict Scoring
+
+The verdict is a deterministic function of `severity_score ∈ [0, 36]`:
+
+| Score | Verdict | Meaning |
+|---|---|---|
+| 0 | SAFE | No signals detected |
+| 1–2 | REVIEW | Minor signals — human review recommended |
+| 3–4 | CAUTION | Elevated signals — scrutinise before merging |
+| ≥ 5 | DESTRUCTIVE | Merge blocked |
+
+### Score Contributions
+
+| Signal | Points |
+|---|---|
+| Branch age > 90 / 180 / 365 days | +1 / +2 / +3 |
+| Files deleted > 10 / 20 / 50 | +1 / +2 / +3 |
+| Deletion ratio > 50% / 70% / 90% (≥100 lines) | +1 / +2 / +3 |
+| Lines deleted > 5k / 10k / 50k | +1 / +2 / +3 |
+| Critical path files deleted | +2 |
+| Security files deleted | +5 |
+| Structural severity CRITICAL (L4) | +5 |
+| Unverified dependency — SCA (per package) | +3 |
+| Added file content: shell or CI patterns | +2 per match, capped +4 |
+| Actions poisoning CRITICAL signal (L2c) | +5 |
+| Actions poisoning HIGH signal (L2c) | +3 |
+| AI config poisoning CRITICAL signal (L2d) | +5 |
+| AI config poisoning HIGH signal (L2d) | +3 |
+
+The three deletion sub-scores (files, ratio, lines) are correlated and capped to prevent triple-counting.
+
+### Actions Poisoning Signals (L2c)
+
+| Signal | Severity | Description |
+|---|---|---|
+| `base64_payload` | CRITICAL | Base64-encoded content piped to a shell interpreter |
+| `credential_harvest` | CRITICAL | Env var exfiltration, cloud metadata endpoint, secret grep |
+| `pull_request_target_with_write_permissions` | CRITICAL | pwn-request attack vector |
+| `oidc_elevation_typosquatted` | CRITICAL | OIDC consumer name typosquatted against a known-safe prefix |
+| `dormant_trigger_with_payload` | HIGH | `workflow_dispatch` or `schedule` + shell execution — hidden activation |
+| `forged_bot_author` | HIGH | Git identity configured to impersonate a known bot |
+| `oidc_elevation_no_consumer` | HIGH | `id-token: write` with no recognised OIDC consumer |
+| `dangerous_trigger_pull_request_target` | HIGH | `pull_request_target` without write permissions |
+
+### AI Config Poisoning Signals (L2d)
+
+Scans added or modified AI tooling config files across 9 surfaces: `.claude/settings.json`, `.gemini/settings.json`, `.cursor/rules/*.mdc`, `.vscode/tasks.json`, `package.json`, `composer.json`, `Gemfile`, `binding.gyp`, and `mcp.json`.
+
+| Signal | Severity | Description |
+|---|---|---|
+| `command_in_session_hook` | CRITICAL | Shell command in a Claude/Gemini `SessionStart` hook |
+| `command_in_folder_open_task` | CRITICAL | VS Code task with `runOn: folderOpen` + dangerous shell command |
+| `lifecycle_script_hijack` | CRITICAL | `preinstall`/`postinstall`/`prepare` npm script with dangerous command |
+| `composer_post_install` | CRITICAL | Composer `post-install-cmd` / `post-update-cmd` with dangerous command |
+| `gemfile_system_call` | CRITICAL | Top-level `system()`, `exec()`, or backtick expression in a Gemfile |
+| `binding_gyp_command_substitution` | CRITICAL | Shell chain (`\|\|`, `&&`, output redirect) inside a `binding.gyp` `<!()` |
+| `cursor_nl_exec_imperative` | HIGH | Cursor rule with `alwaysApply: true` and an execute imperative |
+| `mcp_local_server_command` | HIGH | MCP server config launching a repo-local script |
+| `hidden_unicode` | HIGH | Zero-width, bidi, or Unicode tag-block characters in any config value |
+
+### Temporal Drift (L5a)
+
+`drift_score = branch_age_days × target_commits_per_day`
+
+| Status | drift_score | Meaning |
+|---|---|---|
+| CURRENT | < 250 | Branch context is valid |
+| STALE | 250–999 | Significant divergence — review diff carefully |
+| DANGEROUS | ≥ 1,000 | Rebase required before merging |
+
+### Structural Analysis Languages (L4)
+
+| Language | Tracked constructs |
+|---|---|
+| Python | Functions, classes, async functions, module-level assignments |
+| JavaScript / JSX | Functions, classes, arrow functions, variable declarators |
+| TypeScript / TSX | Functions, classes, interfaces, type aliases, enums |
+| Go | Functions, methods, type specs, const specs |
+| Rust | Functions, structs, enums, traits, const and static items |
+| Java | Methods, classes, interfaces, enums |
+
+Files in languages without an installed grammar are skipped silently.
+
+---
+
+## Formal Verification
+
+PayloadGuard's scoring and consequence models are mathematically verified to ensure deterministic outputs. A bug would have to produce a consistent false result across three independent frameworks simultaneously to go undetected.
+
+| Framework | What is proven |
+|---|---|
+| **CrossHair** — symbolic execution | Consequence model (C1–C12), structural drift (S1–S7), temporal drift (T1–T7), semantic transparency (M1–M9) |
+| **Z3** — SMT theorem prover | Score bounds, verdict bijection, safety-critical floors, empty-input guarantee (P1–P10) |
+| **Dafny** — machine-checked proofs | Full input domain coverage, 12 postconditions verified, 0 errors (POST-1–11a + POST-12) |
+
+**Current test state:** 274 tests pass, 7 skipped.
+
+→ [`VERIFICATION.md`](VERIFICATION.md) — contracts, methods, and run instructions  
+→ [`VERIFICATION_SPEC.md`](VERIFICATION_SPEC.md) — formal specification for external auditors
+
+---
+
+## Contributing
+
+```bash
+python -m pytest test_analyzer.py tests/proofs/ -q
+```
+
+274 pass, 7 skip. New detection signals require test coverage in the relevant layer's test class. Open findings are tracked in [`AUDIT_LOG.md`](AUDIT_LOG.md).
+
+---
+
+*PayloadGuard is maintained by [PayloadGuard-PLG](https://github.com/PayloadGuard-PLG).*

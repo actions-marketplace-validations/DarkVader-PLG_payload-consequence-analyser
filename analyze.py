@@ -12,6 +12,7 @@ Example:
 """
 
 import argparse
+import ast
 import copy
 import git
 import re
@@ -24,6 +25,8 @@ from pathlib import Path
 from typing import Any, Dict, Union
 from dataclasses import dataclass, field
 import structural_parser
+
+__version__ = "1.3.0"
 
 
 # ==============================================================================
@@ -62,6 +65,7 @@ CRITICAL_PATH_PATTERNS = [
     r"(^|/)security[^/]*\.(py|js|ts)$",
     r"(^|/)permission[^/]*\.(py|js|ts)$",
     # Database / schema
+    r"(^|/)database[^/]*\.(py|js|ts)$",
     r"(^|/)migrations?(/|$)",
     r"(^|/)migration[^/]*(\.py|\.sql)?$",
     r"(^|/)schema[^/]*(\.py|\.sql|\.json)?$",
@@ -70,6 +74,15 @@ CRITICAL_PATH_PATTERNS = [
     r"(^|/)(main|app|server|index)\.(py|js|ts)$",
     # Config files
     r"\.(yml|yaml)$",
+]
+
+# Security-critical file patterns — a subset of CRITICAL_PATH_PATTERNS that
+# warrant an immediate high-confidence DESTRUCTIVE signal when deleted.
+_SECURITY_CRITICAL_PATTERNS = [
+    r"(^|/)auth[^/]*\.(py|js|ts)$",
+    r"(^|/)security[^/]*\.(py|js|ts)$",
+    r"(^|/)permission[^/]*\.(py|js|ts)$",
+    r"(^|/)authorization[^/]*\.(py|js|ts)$",
 ]
 
 # Commit message patterns that indicate deliberate destructive intent.
@@ -84,6 +97,379 @@ _COMMIT_RED_FLAG_PATTERNS = [
     r"\bdrop\s+(all\s+)?(tables?|schema|database)\b",
     r"\bremove\s+(auth|security|authentication|authorization)\b",
 ]
+
+# ==============================================================================
+# ADDED FILE CONTENT SCANNING (Layer 1 extension — INC-1, INC-4)
+# Scans added non-code files for CI trigger strings and shell execution patterns.
+# Code extensions are skipped (handled by structural analysis, Layer 4).
+# Known binary extensions are skipped (undecodable content).
+# ==============================================================================
+
+_CONTENT_SCAN_CODE_EXTENSIONS = frozenset({
+    '.py', '.js', '.jsx', '.ts', '.tsx', '.go', '.rs', '.java',
+    '.rb', '.c', '.cpp', '.h', '.hpp', '.cs', '.swift', '.kt',
+})
+
+_CONTENT_BINARY_EXTENSIONS = frozenset({
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico',
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.zip', '.tar', '.gz', '.bz2', '.7z', '.rar',
+    '.exe', '.dll', '.so', '.dylib', '.bin', '.wasm',
+    '.mp3', '.mp4', '.avi', '.mov', '.wav',
+    '.ttf', '.woff', '.woff2', '.eot',
+    '.pyc', '.pyo', '.class', '.o', '.a',
+    '.db', '.sqlite', '.sqlite3',
+})
+
+# Strings embedded in non-code files (README, docs, config) to force CI reruns.
+_CONTENT_CI_TRIGGER_PATTERNS = [
+    r'\[citest',
+    r'\bneeds-ci\b',
+    r'citest\s+commit:',
+    r'\[needs-ci\]',
+]
+
+# Shell execution patterns — a non-code file containing these has runnable intent.
+_CONTENT_SHELL_PATTERNS = [
+    r'\bsudo\s+\S',
+    r'\bsetfacl\s+',
+    r'\bchmod\s+[0-9a-osx+\-]',
+    r'curl\b[^\n]*\|\s*(ba)?sh',
+    r'wget\b[^\n]*\|\s*(ba)?sh',
+    r'\brm\s+-[rf]',
+]
+
+# ==============================================================================
+# GITHUB ACTIONS POISONING DETECTION (Layer 2c)
+# Scans added and modified .github/workflows/ and .github/actions/ YAML files
+# for poisoning signals. Complements Layer 2 (which catches deletion of .github/
+# files) by inspecting the *content* of new/changed workflow definitions.
+# ==============================================================================
+
+_ACTIONS_WORKFLOW_PATTERN = r"(^|/)\.github/(workflows|actions)/[^/]*\.(yml|yaml)$"
+
+# Signal 1: Base64-encoded payload delivery
+_ACTIONS_BASE64_PAYLOAD = [
+    r"base64\s+-d\s*\|\s*(ba)?sh",
+    r"\|\s*base64\s+--decode\s*\|\s*(ba)?sh",
+    r"echo\s+['\"]?[A-Za-z0-9+/]{20,}={0,2}['\"]?\s*\|\s*(ba)?sh",
+]
+
+# Signal 2: Credential harvesting — env dumps, secret grep, metadata endpoints
+_ACTIONS_CREDENTIAL_HARVEST = [
+    r"curl\s+http://169\.254\.169\.254",
+    r"env\b[^\n]*\|\s*(grep|awk|sed)\b[^\n]*(KEY|TOKEN|SECRET|PASSWORD|CRED)",
+    r"printenv\b[^\n]*\|\s*(grep|awk)\b",
+    r"grep\s+-r[^\n]*(AWS_|GITHUB_TOKEN|api[_-]?key|ssh-rsa)",
+    r"cat\s+~?/\.ssh/(id_rsa|id_ed25519|authorized_keys)",
+    # RTA-05 fix: curl with secret in URL (original pattern — http after secret)
+    r"curl\b[^\n]*\$\{\{\s*secrets\.[A-Z_]+\s*\}\}[^\n]*http",
+    # RTA-05 fix: secret passed as HTTP auth header (-H / --header), works
+    # even when curl spans multiple lines with backslash continuation.
+    r"(?:-H|--header)\s+[\"'][^\"']*\$\{\{\s*secrets\.[A-Z_]+\s*\}\}",
+    # RTA-02 fix: secret exfiltrated via GITHUB_OUTPUT or GITHUB_STEP_SUMMARY
+    r"echo\b[^\n]*\$\{\{\s*secrets\.[A-Z_]+\s*\}\}[^\n]*>>\s*\$GITHUB_OUTPUT",
+    r"echo\b[^\n]*\$\{\{\s*secrets\.[A-Z_]+\s*\}\}[^\n]*>>\s*\$GITHUB_STEP_SUMMARY",
+]
+
+# Signal 7: GitHub environment file injection — poisons PATH, LD_PRELOAD, or
+# NODE_OPTIONS for subsequent steps via $GITHUB_ENV. Distinguished from
+# legitimate env-var setting by the presence of path-manipulation values.
+_ACTIONS_GITHUB_ENV_INJECTION = re.compile(
+    r"echo\s+['\"]?(PATH=|LD_PRELOAD=|LD_LIBRARY_PATH=|NODE_OPTIONS=--require)[^\n]*>>\s*\$GITHUB_ENV",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# ==============================================================================
+# SEMANTIC TRANSPARENCY (Layer 5b v2) — PR-MCI heuristic engine
+# Derives mci_score from five signals:
+#   V_s  Scope Adequacy        — description verbosity vs diff churn
+#   V_o  Operation Mutation    — claimed op type vs structural alterations
+#   V_f  File-Type Verify      — sensitive files in diff not acknowledged
+#   V_r  Phantom Additions     — remedial claim + high insertion ratio
+#   V_e  Cross-stack micro     — micro claim touches ≥3 distinct file types
+# ==============================================================================
+
+_SEMANTIC_MICRO_SCOPE = frozenset({
+    'typo', 'minor', 'trivial', 'small', 'cosmetic', 'syntax', 'formatting',
+    'cleanup', 'whitespace', 'indent', 'comment', 'docs', 'readme', 'changelog',
+    'spelling', 'grammar', 'style', 'lint', 'nit', 'docstring',
+})
+_SEMANTIC_MACRO_SCOPE = frozenset({
+    'massive', 'major', 'complete', 'total', 'overhaul', 'rewrite', 'rework',
+    'architecture', 'architectural', 'global', 'substantial', 'large',
+    'significant', 'comprehensive', 'entire',
+})
+_SEMANTIC_ADDITIVE_STEMS    = frozenset({'add', 'implement', 'creat', 'introduc', 'integrat', 'build', 'extend', 'new'})
+_SEMANTIC_DESTRUCTIVE_STEMS = frozenset({'remov', 'delet', 'drop', 'deprecat', 'destroy', 'clean', 'purg', 'strip'})
+_SEMANTIC_MUTATIVE_STEMS    = frozenset({'updat', 'modif', 'refactor', 'rewrit', 'restructur', 'bump', 'chang', 'migrat', 'replac'})
+_SEMANTIC_REMEDIAL_STEMS    = frozenset({'fix', 'patch', 'resolv', 'revert', 'correct', 'repair', 'hotfix'})
+
+_SEMANTIC_SUFFIXES = [  # Lovins-inspired, longest-first; guard: stem must remain ≥3 chars
+    ('ations', ''), ('ation', ''), ('tions', ''), ('tion', ''),
+    ('ments', ''), ('ment', ''), ('ness', ''), ('ings', ''), ('ing', ''),
+    ('ized', ''), ('izes', ''), ('ize', ''), ('ified', ''), ('ify', ''),
+    ('able', ''), ('ible', ''), ('ed', ''), ('ers', ''), ('er', ''),
+    ('ies', 'y'), ('es', ''), ('s', ''),
+]
+
+_SEMANTIC_SENSITIVE_PATHS = [
+    re.compile(r'\.github/workflows/', re.IGNORECASE),
+    re.compile(r'(?:^|/)auth[^/]*\.', re.IGNORECASE),
+    re.compile(r'package\.json|requirements\.txt|Pipfile|go\.mod|Cargo\.toml', re.IGNORECASE),
+    re.compile(r'Dockerfile|docker-compose', re.IGNORECASE),
+    re.compile(r'schema\.|migration', re.IGNORECASE),
+    re.compile(r'(?:^|/)secrets?[^/]*\.', re.IGNORECASE),
+]
+
+# Signal 3: Dormant trigger — workflow_dispatch or schedule combined with a
+# shell execution pattern in the same file constitutes a sleeper payload.
+_ACTIONS_DORMANT_TRIGGER = [
+    r"on:\s*\n\s+workflow_dispatch",
+    r"on:\s*\[?\s*schedule",
+]
+
+# Signal 4: Forged bot / impersonator commit identity
+_ACTIONS_FORGED_AUTHOR = re.compile(
+    r"git\s+config\s+user\.(name|email)\s+['\"]?("
+    r"build-bot|auto-ci|ci-bot|github-actions\[bot\]|actions-bot|dependabot"
+    r")['\"]?",
+    re.IGNORECASE,
+)
+
+# Signal 5: Elevated OIDC permissions without a legitimate cloud consumer.
+# id-token: write grants ambient cloud credentials — only legitimate alongside
+# known cloud-auth actions. Exact-match list prevents typosquatted action names
+# (e.g. aws-actions-unofficial/) from bypassing the check.
+# Extend via payloadguard.yml: actions.trusted_oidc_consumers list.
+_ACTIONS_OIDC_ELEVATION_PATTERN = re.compile(r"id-token:\s*write", re.IGNORECASE)
+_SAFE_OIDC_CONSUMERS_DEFAULT = [
+    "aws-actions/configure-aws-credentials",
+    "google-github-actions/auth",
+    "azure/login",
+]
+
+# OIDC Consumer Allowlist (Exact Match Only)
+_SAFE_OIDC_CONSUMERS = [
+    'aws-actions/configure-aws-credentials',
+    'google-github-actions/auth',
+    'azure/login',
+    'azure/login@v1',
+]
+
+_SAFE_OIDC_PREFIXES = [
+    'aws-actions/',
+    'google-github-actions/',
+    'azure/',
+]
+
+
+def _is_oidc_consumer_legitimate(action_string):
+    """Check if action is in the safe OIDC allowlist."""
+    return any(action_string.startswith(safe) for safe in _SAFE_OIDC_CONSUMERS)
+
+
+def _is_oidc_consumer_typosquatted(action_string):
+    """
+    Detect if action appears to be a typosquat of a known-safe OIDC consumer.
+
+    Typosquats: aws-actions-unofficial/, aws-action/, google-github-action-fork/, etc.
+    """
+    if not action_string:
+        return False
+
+    # Pattern 1: Uses safe prefix but isn't on allowlist
+    for prefix in _SAFE_OIDC_PREFIXES:
+        if action_string.startswith(prefix):
+            if not _is_oidc_consumer_legitimate(action_string):
+                return True
+
+    # Pattern 2: Common typosquat indicators
+    typosquat_patterns = [
+        'aws-actions-',
+        'aws-action/',
+        'google-github-actions-',
+        'google-github-action-',
+        'google-github-action/',
+        'azure-login',
+    ]
+    return any(pattern in action_string for pattern in typosquat_patterns)
+
+
+# Signal 6: pull_request_target trigger — runs in the base-branch context with
+# repository secrets accessible even when triggered by a fork PR. Standalone use
+# is HIGH; combined with any write permission it is CRITICAL because an attacker
+# can both read secrets and push code/artifacts.
+_ACTIONS_DANGEROUS_TRIGGERS = re.compile(r"\bpull_request_target\b", re.IGNORECASE)
+_ACTIONS_WRITE_PERMISSIONS = re.compile(
+    r"contents:\s*write|pull-requests:\s*write|packages:\s*write|deployments:\s*write",
+    re.IGNORECASE,
+)
+
+# ==============================================================================
+# AI TOOLING CONFIG POISONING DETECTION (Layer 2d)
+# Scans added and modified AI coding agent and IDE config files for auto-execution
+# primitives. Confirmed in-the-wild surfaces from the Miasma/TeamPCP campaign:
+# .claude/settings.json, .gemini/settings.json, .cursor/rules/*.mdc,
+# .vscode/tasks.json, package.json lifecycle scripts, composer.json
+# post-install-cmd, Gemfile system(), binding.gyp <!(shell chain).
+# CVEs: CVE-2025-59536, CVE-2026-21852, CVE-2025-54136, CVE-2025-54135.
+# ==============================================================================
+
+_AI_CONFIG_PATH_RE = re.compile(
+    r'(^|/)(\.claude/settings\.json'
+    r'|\.gemini/settings\.json'
+    r'|\.cursor/rules/[^/]+\.mdc'
+    r'|\.vscode/tasks\.json'
+    r'|\.cursor/mcp\.json'
+    r'|\.vscode/mcp\.json'
+    r'|mcp\.json'
+    r'|composer\.json'
+    r'|Gemfile'
+    r'|binding\.gyp'
+    r'|package\.json)$',
+    re.IGNORECASE,
+)
+
+# Critical command patterns in hook/task/script fields:
+# pipe-to-shell, payload decode, eval, interpreter on .github/ path,
+# JS obfuscation, crypto decryption, bun install, memory scraping.
+_AI_HOOK_CRITICAL_CMDS = re.compile(
+    r'(\|\s*(ba)?sh\b'
+    r'|base64\s+-d'
+    r'|eval\s*\('
+    r'|\b(node|bun|deno)\b[^\n]*\.github/'
+    r'|String\.fromCharCode'
+    r'|createDecipheriv'
+    r'|oven-sh/bun/releases'
+    r'|/proc/\*/mem)',
+    re.IGNORECASE,
+)
+
+# Hidden Unicode: zero-width chars, bidi controls, invisible tag block.
+_HIDDEN_UNICODE_RE = re.compile(
+    r'[​-‍‪-‮⁦-⁩﻿0-f]'
+)
+
+# Gemfile top-level execution primitives.
+_GEMFILE_EXEC_RE = re.compile(
+    r'^\s*(system\s*\(|exec\s*\(|`)',
+    re.MULTILINE,
+)
+
+# binding.gyp: shell-chain/redirection form (malicious) vs safe require lookup.
+_BINDING_GYP_CHAIN_RE = re.compile(
+    r'<!\([^)]*(\|\||&&|>\s*/dev/null|2>&1)[^)]*\)',
+    re.IGNORECASE,
+)
+_BINDING_GYP_SAFE_RE = re.compile(
+    r'<!\(\s*node\s+-[pe]\s+["\']require\(',
+    re.IGNORECASE,
+)
+
+# Cursor .mdc rule: NL imperative to run/execute something.
+_CURSOR_EXEC_IMPERATIVE_RE = re.compile(
+    r'(`[^`]+`|run\s+`|\bnode\s+\S|\bcurl\s+\S|\bexecute\b)',
+    re.IGNORECASE,
+)
+
+# Package.json lifecycle keys that auto-execute on install/build.
+_PACKAGE_LIFECYCLE_KEYS = frozenset({
+    'preinstall', 'install', 'postinstall', 'prepare', 'prepack', 'postpack',
+})
+
+# Composer.json lifecycle keys that auto-execute on install/update.
+_COMPOSER_LIFECYCLE_KEYS = frozenset({
+    'post-install-cmd', 'post-update-cmd', 'post-autoload-dump', 'pre-install-cmd',
+})
+
+# ==============================================================================
+# SCA — DEPENDENCY MANIFEST PATTERNS (Layer 2b)
+# Opt-in: only runs when allowlist.yml is present in the repo root.
+# ==============================================================================
+
+_MANIFEST_PATTERNS = {
+    r"(^|/)requirements[^/]*\.txt$": "pip",
+    r"(^|/)package\.json$":          "npm",
+    r"(^|/)go\.mod$":                "go",
+    r"(^|/)Cargo\.toml$":            "cargo",
+    r"(^|/)pyproject\.toml$":        "pyproject",
+}
+
+_MANIFEST_ALLOWLIST_KEY = {
+    "pip": "python", "pyproject": "python",
+    "npm": "npm", "go": "go", "cargo": "rust",
+}
+
+_TOML_SKIP_KEYS = {"name", "version", "edition", "authors", "description", "license", "readme", "build"}
+_JSON_SKIP_KEYS = {
+    "version", "description", "name", "main", "scripts", "keywords",
+    "author", "license", "private", "type", "homepage", "repository", "bugs",
+}
+
+
+def _parse_added_packages(diff_text: str, manifest_type: str) -> list:
+    """Extract newly added package names from a unified diff of a manifest file."""
+    packages = []
+    for line in diff_text.splitlines():
+        if not line.startswith('+') or line.startswith('+++'):
+            continue
+        content = line[1:].strip()
+        if manifest_type in ("pip",):
+            m = re.match(r'^([A-Za-z0-9][A-Za-z0-9._-]*)', content)
+            if m:
+                packages.append(m.group(1).lower())
+        elif manifest_type == "pyproject":
+            m = re.match(r'^["\']?([A-Za-z0-9][A-Za-z0-9._-]*)', content)
+            if m:
+                pkg = m.group(1).lower()
+                if pkg not in _TOML_SKIP_KEYS:
+                    packages.append(pkg)
+        elif manifest_type == "npm":
+            m = re.match(r'^"([^"]+)"\s*:', content)
+            if m:
+                pkg = m.group(1)
+                if pkg not in _JSON_SKIP_KEYS:
+                    packages.append(pkg)
+        elif manifest_type == "go":
+            m = re.match(r'^(?:require\s+)?([a-z][a-z0-9./\-]+)\s+v', content)
+            if m:
+                packages.append(m.group(1))
+        elif manifest_type == "cargo":
+            m = re.match(r'^([a-zA-Z][a-zA-Z0-9_-]*)\s*[=\[]', content)
+            if m:
+                pkg = m.group(1).lower()
+                if pkg not in _TOML_SKIP_KEYS:
+                    packages.append(pkg)
+    return packages
+
+
+def _normalize_yaml_content(content: str) -> str:
+    """Collapse YAML folded/literal block scalars to a single line.
+
+    YAML folded blocks (>) and literal blocks (|) split a single logical shell
+    command across multiple lines in the raw file, which prevents single-line
+    regex patterns from matching. Joining all lines with a space produces the
+    same string that the shell would execute, making patterns like
+    'base64 -d | bash' visible regardless of how the YAML was formatted.
+
+    Only use this for base64/payload patterns. Do NOT normalise before checks
+    that rely on line structure (dormant-trigger composite, forged-author).
+    """
+    return " ".join(content.split())
+
+
+def _load_allowlist(repo_path: str):
+    """Load allowlist.yml from repo root. Returns None if absent (SCA opt-out)."""
+    p = Path(repo_path) / "allowlist.yml"
+    if not p.exists():
+        return None
+    try:
+        with open(p) as f:
+            data = yaml.safe_load(f) or {}
+        return {k: set(str(v).lower() for v in lst) for k, lst in data.items() if isinstance(lst, list)}
+    except Exception:
+        return None
 
 
 # ==============================================================================
@@ -123,12 +509,14 @@ class StructuralPayloadAnalyzer:
         file_path: str = "",
         deletion_ratio_threshold: float = 0.20,
         min_deletion_count: int = 3,
+        complexity_threshold: int = 15,
     ):
         self.original_code = original_code
         self.modified_code = modified_code
         self.file_path = file_path
         self.deletion_ratio_threshold = deletion_ratio_threshold
         self.min_deletion_count = min_deletion_count
+        self.complexity_threshold = complexity_threshold
 
     def _extract_core_nodes(self, source_text: str) -> set:
         return structural_parser.extract_named_nodes(source_text, self.file_path)
@@ -155,6 +543,29 @@ class StructuralPayloadAnalyzer:
             and len(deleted_nodes) >= self.min_deletion_count
         )
 
+        # Feature B: McCabe complexity advisory for newly added Python functions
+        complexity_advisory = []
+        if self.file_path.endswith('.py') and added_nodes:
+            try:
+                tree = ast.parse(self.modified_code)
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if node.name in added_nodes:
+                            complexity = 1
+                            for child in ast.walk(node):
+                                if isinstance(child, (ast.If, ast.For, ast.While, ast.ExceptHandler)):
+                                    complexity += 1
+                                elif isinstance(child, ast.BoolOp):
+                                    complexity += len(child.values) - 1
+                            if complexity > self.complexity_threshold:
+                                complexity_advisory.append({
+                                    "name": node.name,
+                                    "complexity": complexity,
+                                    "threshold": self.complexity_threshold,
+                                })
+            except SyntaxError:
+                pass
+
         return {
             "status": "DESTRUCTIVE" if is_destructive else "SAFE",
             "severity": "CRITICAL" if is_destructive else "LOW",
@@ -167,6 +578,7 @@ class StructuralPayloadAnalyzer:
             },
             "deleted_components": sorted(deleted_nodes),
             "added_components": sorted(added_nodes),
+            "complexity_advisory": complexity_advisory,
         }
 
 
@@ -244,67 +656,206 @@ class TemporalDriftAnalyzer:
 # ==============================================================================
 
 class SemanticTransparencyAnalyzer:
+    """Layer 5b v2 — PR-MCI heuristic semantic transparency engine.
+
+    Three-phase analysis: Linguistic Lexer → Diff Profiler → Cross-Correlation.
+    Derives mci_score ∈ [0,1] from five signals (V_s/V_o/V_f/V_r/V_e).
+    Zero external dependencies. Sub-second execution.
+
+    Status values:
+      UNVERIFIED        No PR description — cannot evaluate
+      TRANSPARENT       Description consistent with diff profile
+      CAUTION_MISMATCH  Partial inconsistency — manual review advised
+      DECEPTIVE_PAYLOAD High-confidence mismatch — escalation triggered
     """
-    Evaluates the integrity of a pull request by comparing the stated intent
-    (PR description) against the actual structural impact (severity verdict).
 
-    Detects the 'benign description / catastrophic payload' pattern that was
-    central to the April 2026 Codex incident.
+    def __init__(self, pr_description: str, diffs, config: dict = None):
+        self.pr_description = pr_description or ''
+        self.diffs = list(diffs) if diffs is not None else []
+        self.config = config or {}
 
-    Configurable:
-        benign_keywords (list): Phrases that signal a claimed low-impact change.
-    """
+    # ── Phase 1: Linguistic Lexer ─────────────────────────────────────────────
 
-    DEFAULT_BENIGN_KEYWORDS = [
-        "minor fix",
-        "minor syntax fix",
-        "typo",
-        "formatting",
-        "cleanup",
-        "docs",
-        "refactor whitespace",
-        "small tweak",
-        "cosmetic",
-        "minor update",
-    ]
+    @staticmethod
+    def _stem(word: str) -> str:
+        """Lovins-inspired suffix stripper — stem must remain ≥3 chars."""
+        if len(word) <= 3:
+            return word
+        for suffix, replacement in _SEMANTIC_SUFFIXES:
+            if word.endswith(suffix):
+                candidate = word[:-len(suffix)] + replacement
+                if len(candidate) >= 3:
+                    return candidate
+        return word
 
-    def __init__(
-        self,
-        pr_description: str,
-        actual_severity: str,
-        benign_keywords: list = None,
-    ):
-        self.pr_description = pr_description.lower().strip()
-        self.actual_severity = actual_severity.upper()
-        self.benign_keywords = benign_keywords if benign_keywords is not None else self.DEFAULT_BENIGN_KEYWORDS
+    @staticmethod
+    def _sanitize(text: str) -> str:
+        """Strip markdown, normalize to lowercase ASCII."""
+        text = re.sub(r'```.*?```', ' ', text, flags=re.DOTALL)
+        text = re.sub(r'`[^`]+`', ' ', text)
+        text = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', text)
+        text = re.sub(r'[#*_~>|]', ' ', text)
+        return text.encode('ascii', errors='ignore').decode().lower()
 
-    def analyze_transparency(self) -> Dict[str, Union[str, bool]]:
-        if not self.pr_description:
-            return {
-                "status": "UNVERIFIED",
-                "is_deceptive": False,
-                "matched_keyword": None,
-                "directive": "⚠ CAUTION. No PR description provided for semantic analysis.",
-            }
+    def _extract_claim(self) -> dict:
+        """Extract Semantic Claim Object: scope, dominant_op, raw_tokens."""
+        clean = self._sanitize(self.pr_description)
+        tokens = re.findall(r'[a-z0-9_/.-]+', clean)
+        raw = set(tokens)
+        stems = {self._stem(t) for t in tokens if len(t) > 2}
 
-        matched_keyword = next(
-            (kw for kw in self.benign_keywords if kw in self.pr_description), None
+        scope = 'unspecified'
+        if raw & _SEMANTIC_MICRO_SCOPE:
+            scope = 'micro'
+        elif raw & _SEMANTIC_MACRO_SCOPE:
+            scope = 'macro'
+
+        dominant_op = 'unspecified'
+        for op_name, op_set in [
+            ('remedial',    _SEMANTIC_REMEDIAL_STEMS),
+            ('destructive', _SEMANTIC_DESTRUCTIVE_STEMS),
+            ('additive',    _SEMANTIC_ADDITIVE_STEMS),
+            ('mutative',    _SEMANTIC_MUTATIVE_STEMS),
+        ]:
+            if stems & op_set:
+                dominant_op = op_name
+                break
+
+        return {'scope': scope, 'dominant_op': dominant_op, 'raw_tokens': sorted(raw)}
+
+    # ── Phase 2: Diff Profiler ────────────────────────────────────────────────
+
+    def _profile_diff(self) -> dict:
+        """Extract Diff Reality Object: churn, extensions, structural alterations."""
+        lines_added = lines_deleted = structural_alterations = 0
+        extensions: set = set()
+        sensitive_paths: list = []
+
+        struct_pat = re.compile(
+            r'^\+[ \t]*(def |class |async def |function |interface |struct )',
         )
-        claims_benign = matched_keyword is not None
-        is_deceptive = claims_benign and self.actual_severity == "CRITICAL"
 
-        if is_deceptive:
-            status = "DECEPTIVE_PAYLOAD"
-            directive = "❌ DO NOT MERGE. PR description deliberately contradicts catastrophic architectural changes."
-        else:
-            status = "TRANSPARENT"
-            directive = "✓ SAFE. PR description aligns with verified structural impact."
+        for d in self.diffs:
+            path = d.b_path or getattr(d, 'a_path', '') or ''
+            if not isinstance(path, str):
+                path = ''
+            if path:
+                ext = Path(path).suffix.lower()
+                if ext:
+                    extensions.add(ext)
+                for pat in _SEMANTIC_SENSITIVE_PATHS:
+                    if pat.search(path):
+                        sensitive_paths.append(path)
+                        break
+
+            try:
+                diff_bytes = d.diff if isinstance(d.diff, bytes) else b''
+                diff_text = diff_bytes.decode('utf-8', errors='replace')
+            except Exception:
+                diff_text = ''
+
+            for line in diff_text.splitlines():
+                if line.startswith('+') and not line.startswith('+++'):
+                    lines_added += 1
+                    if struct_pat.match(line):
+                        structural_alterations += 1
+                elif line.startswith('-') and not line.startswith('---'):
+                    lines_deleted += 1
+
+        total_churn = lines_added + lines_deleted
+        insertion_ratio = lines_added / total_churn if total_churn else 0.0
 
         return {
-            "status": status,
-            "is_deceptive": is_deceptive,
-            "matched_keyword": matched_keyword,
-            "directive": directive,
+            'lines_added': lines_added,
+            'lines_deleted': lines_deleted,
+            'total_churn': total_churn,
+            'insertion_ratio': insertion_ratio,
+            'ext_count': len(extensions),
+            'structural_alterations': structural_alterations,
+            'sensitive_paths': sensitive_paths,
+        }
+
+    # ── Phase 3: Cross-Correlation Matrix ────────────────────────────────────
+
+    def analyze_transparency(self) -> dict:
+        if not self.pr_description.strip():
+            return {
+                'status': 'UNVERIFIED',
+                'is_deceptive': False,
+                'matched_keyword': None,
+                'directive': '⚠ CAUTION. No PR description provided for semantic analysis.',
+                'mci_score': 0.0,
+                'signals': [],
+                'semantic_claim': {},
+                'diff_reality': {},
+            }
+
+        claim   = self._extract_claim()
+        reality = self._profile_diff()
+        signals: list = []
+        mci_score = 0.0
+
+        churn_limit   = self.config.get('micro_scope_churn_limit', 50)
+        fix_ir_thresh = self.config.get('insertion_ratio_fix_threshold', 0.9)
+
+        # V_s — Scope Adequacy: micro claim but large churn
+        if claim['scope'] == 'micro' and reality['total_churn'] > churn_limit:
+            signals.append('scope_understated')
+            mci_score += 0.4
+
+        # V_o — Operation Mutation: micro claim + new structural declarations
+        if claim['scope'] == 'micro' and reality['structural_alterations'] > 0:
+            signals.append('operation_mutation')
+            mci_score += 0.3
+
+        # V_f — Hidden Component: sensitive file modified but not named in description
+        if reality['sensitive_paths'] and claim['scope'] == 'micro':
+            desc_lower = self.pr_description.lower()
+            unacknowledged = [
+                p for p in reality['sensitive_paths']
+                if not any(part.lower() in desc_lower
+                           for part in Path(p).parts[-2:] if len(part) > 2)
+            ]
+            if unacknowledged:
+                signals.append('hidden_component_modification')
+                mci_score += 0.3
+
+        # V_r — Phantom Additions: "fix" claim but diff is almost entirely additions
+        if claim['dominant_op'] == 'remedial' and reality['insertion_ratio'] > fix_ir_thresh:
+            signals.append('phantom_additions')
+            mci_score += 0.4
+
+        # V_e — Cross-stack micro claim: touches ≥3 distinct file types
+        if claim['scope'] == 'micro' and reality['ext_count'] >= 3:
+            signals.append('cross_stack_micro_claim')
+            mci_score += 0.2
+
+        # Macro scope → human reviewer advisory; no MCI penalty (attacker who
+        # claims a massive change loses the stealth advantage anyway)
+        if claim['scope'] == 'macro':
+            signals.append('macro_scope_manual_review')
+
+        mci_score = min(round(mci_score, 3), 1.0)
+
+        if mci_score >= 0.5:
+            status, is_deceptive = 'DECEPTIVE_PAYLOAD', True
+            directive = '❌ DO NOT MERGE. PR description is inconsistent with actual diff scope and structure.'
+        elif mci_score > 0.0 or 'macro_scope_manual_review' in signals:
+            status, is_deceptive = 'CAUTION_MISMATCH', False
+            directive = '⚠ REVIEW ADVISED. Partial mismatch between stated intent and diff profile.'
+        else:
+            status, is_deceptive = 'TRANSPARENT', False
+            directive = '✓ Description aligns with verified diff scope and operation type.'
+
+        return {
+            'status': status,
+            'is_deceptive': is_deceptive,
+            'matched_keyword': signals[0] if signals else None,  # backwards compat
+            'directive': directive,
+            'mci_score': mci_score,
+            'signals': signals,
+            'semantic_claim': claim,
+            'diff_reality': reality,
         }
 
 
@@ -322,17 +873,25 @@ DEFAULT_CONFIG = {
             "dangerous": 1000.0,
         },
         "structural": {
-            "deletion_ratio":    0.20,
-            "min_deleted_nodes": 3,
+            "deletion_ratio":       0.20,
+            "min_deleted_nodes":    3,
+            "complexity_threshold": 15,
         },
     },
     "semantic": {
-        "benign_keywords": [
-            "minor fix", "minor syntax fix", "typo",
-            "formatting", "cleanup", "docs",
-            "refactor whitespace", "small tweak",
-            "cosmetic", "minor update",
-        ],
+        "enabled": True,
+        "micro_scope_churn_limit": 50,
+        "insertion_ratio_fix_threshold": 0.9,
+        "benign_keywords": [],  # legacy — kept for payloadguard.yml compat; unused by v2
+    },
+    "sca": {
+        "fail_on_unknown": True,
+    },
+    "actions": {
+        "enabled": True,
+        "critical_signal_score": 5,
+        "high_signal_score": 3,
+        "trusted_oidc_consumers": [],
     },
 }
 
@@ -341,6 +900,8 @@ DEFAULT_CONFIG = {
 class PayloadGuardConfig:
     thresholds: dict = field(default_factory=lambda: copy.deepcopy(DEFAULT_CONFIG["thresholds"]))
     semantic: dict   = field(default_factory=lambda: copy.deepcopy(DEFAULT_CONFIG["semantic"]))
+    sca: dict        = field(default_factory=lambda: copy.deepcopy(DEFAULT_CONFIG["sca"]))
+    actions: dict    = field(default_factory=lambda: copy.deepcopy(DEFAULT_CONFIG["actions"]))
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -365,7 +926,8 @@ def load_config(repo_path: str) -> PayloadGuardConfig:
     try:
         with open(config_path) as f:
             user_cfg = yaml.safe_load(f) or {}
-    except Exception:
+    except yaml.YAMLError as e:
+        print(f"WARNING: payloadguard.yml is invalid and has been ignored: {e}", file=sys.stderr)
         return PayloadGuardConfig()
     merged = _deep_merge(DEFAULT_CONFIG, user_cfg)
     merged_thresholds = merged.get("thresholds", copy.deepcopy(DEFAULT_CONFIG["thresholds"]))
@@ -375,10 +937,11 @@ def load_config(repo_path: str) -> PayloadGuardConfig:
             merged_thresholds[_key] = sorted(_val)
     return PayloadGuardConfig(
         thresholds=merged_thresholds,
-        semantic=merged.get("semantic",   copy.deepcopy(DEFAULT_CONFIG["semantic"])),
+        semantic=merged.get("semantic", copy.deepcopy(DEFAULT_CONFIG["semantic"])),
+        sca=merged.get("sca",           copy.deepcopy(DEFAULT_CONFIG["sca"])),
+        actions=merged.get("actions",   copy.deepcopy(DEFAULT_CONFIG["actions"])),
     )
-
-
+    
 # ==============================================================================
 # CORE ANALYZER
 # ==============================================================================
@@ -518,9 +1081,10 @@ class PayloadAnalyzer:
             structural_score = 0.0
             structural_flags = []
             overall_structural_severity = "LOW"
+            complexity_advisory_all: list = []
 
             for d in diffs:
-                if d.change_type != 'M':
+                if d.change_type not in ('M', 'R'):
                     continue
                 path = d.b_path or d.a_path or ''
                 if structural_parser.language_for_path(path) is None:
@@ -533,21 +1097,45 @@ class PayloadAnalyzer:
                         file_path=path,
                         deletion_ratio_threshold=structural_th["deletion_ratio"],
                         min_deletion_count=structural_th["min_deleted_nodes"],
+                        complexity_threshold=structural_th.get("complexity_threshold", 15),
                     ).analyze_structural_drift()
-                    if 'error' not in result and result['metrics']['deleted_node_count'] > 0:
-                        ratio = result['metrics']['structural_deletion_ratio']
-                        structural_score = max(structural_score, ratio)
-                        structural_flags.append({
-                            'file': path,
-                            'status': result['status'],
-                            'severity': result['severity'],
-                            'metrics': result['metrics'],
-                            'deleted_components': result['deleted_components'],
-                        })
-                        if result['severity'] == 'CRITICAL':
-                            overall_structural_severity = 'CRITICAL'
+                    if 'error' not in result:
+                        for ca in result.get('complexity_advisory', []):
+                            complexity_advisory_all.append({'file': path, **ca})
+                        if result['metrics']['deleted_node_count'] > 0:
+                            ratio = result['metrics']['structural_deletion_ratio']
+                            structural_score = max(structural_score, ratio)
+                            structural_flags.append({
+                                'file': path,
+                                'status': result['status'],
+                                'severity': result['severity'],
+                                'metrics': result['metrics'],
+                                'deleted_components': result['deleted_components'],
+                            })
+                            if result['severity'] == 'CRITICAL':
+                                overall_structural_severity = 'CRITICAL'
                 except Exception:
                     pass
+
+            # Cross-file structural aggregation: distributed deletions across
+            # multiple files can collectively constitute a destructive payload
+            # even when no single file exceeds the per-file ratio threshold.
+            # Both the absolute count AND the cross-file ratio must exceed their
+            # thresholds — mirrors the per-file dual-condition gate.
+            if overall_structural_severity != 'CRITICAL' and len(structural_flags) >= 2:
+                total_deleted_nodes = sum(
+                    f['metrics']['deleted_node_count'] for f in structural_flags
+                )
+                total_original_nodes = sum(
+                    f['metrics']['original_node_count'] for f in structural_flags
+                )
+                cross_file_ratio = (
+                    total_deleted_nodes / total_original_nodes
+                    if total_original_nodes > 0 else 0
+                )
+                if (total_deleted_nodes >= structural_th["min_deleted_nodes"]
+                        and cross_file_ratio > structural_th["deletion_ratio"]):
+                    overall_structural_severity = 'CRITICAL'
 
             branch_commit = self.repo.commit(branch_ref)
             target_commit = self.repo.commit(target_ref)
@@ -565,8 +1153,65 @@ class PayloadAnalyzer:
                 f for f in deleted_files
                 if any(re.search(p, f) for p in CRITICAL_PATH_PATTERNS)
             ]
+            security_deletions = [
+                f for f in deleted_files
+                if any(re.search(p, f) for p in _SECURITY_CRITICAL_PATTERNS)
+            ]
+
+            # LAYER 2b: SCA — dependency manifest scanning (opt-in via allowlist.yml)
+            allowlist = _load_allowlist(self.repo_path)
+            sca_flags: list = []
+            sca_manifests_scanned: list = []
+            if allowlist is not None:
+                for d in diffs:
+                    if d.change_type not in ('A', 'M'):
+                        continue
+                    path = d.b_path or d.a_path or ''
+                    manifest_type = next(
+                        (mt for pat, mt in _MANIFEST_PATTERNS.items() if re.search(pat, path)),
+                        None,
+                    )
+                    if manifest_type is None:
+                        continue
+                    sca_manifests_scanned.append(path)
+                    allowlist_key = _MANIFEST_ALLOWLIST_KEY.get(manifest_type, manifest_type)
+                    allowed = allowlist.get(allowlist_key, set())
+                    try:
+                        diff_text = self.repo.git.diff(merge_base[0].hexsha, branch_ref, '--', path)
+                        added_pkgs = _parse_added_packages(diff_text, manifest_type)
+                        seen = set()
+                        for pkg in added_pkgs:
+                            if pkg not in allowed and pkg not in seen:
+                                seen.add(pkg)
+                                sca_flags.append({
+                                    "package": pkg,
+                                    "manifest": path,
+                                    "manifest_type": manifest_type,
+                                })
+                    except Exception:
+                        pass
+
+            sca_result = {
+                "status": "FLAGGED" if sca_flags else "CLEAN",
+                "unverified_packages": sca_flags[:20],
+                "manifest_files_scanned": sca_manifests_scanned,
+                "allowlist_active": allowlist is not None,
+            }
+
+            # LAYER 1 (extension): Added non-code file content scanning (INC-1, INC-4)
+            added_file_flags = self._scan_added_file_content(diffs)
+
+            # LAYER 2c: GitHub Actions poisoning detection
+            actions_poison_flags = self._scan_github_actions_poisoning(diffs)
+
+            # LAYER 2d: AI tooling config poisoning detection
+            ai_config_flags = self._scan_ai_tooling_configs(diffs)
+
+            # Mutable action ref advisory (no score impact)
+            mutable_tag_warnings = _scan_mutable_action_refs(diffs)
 
             # LAYER 3: CONSEQUENCE VERDICT
+            unverified_dep_count = len(sca_flags) if self.config.sca.get("fail_on_unknown", True) else 0
             verdict = self._assess_consequence(
                 files_deleted,
                 lines_deleted,
@@ -574,6 +1219,17 @@ class PayloadAnalyzer:
                 deletion_ratio,
                 overall_structural_severity,
                 critical_file_deletions=len(critical_deletions),
+                security_file_deletions=len(security_deletions),
+                unverified_dependencies=unverified_dep_count,
+                content_flags=len(added_file_flags),
+                actions_poisoning_flags=len(actions_poison_flags),
+                actions_poisoning_critical=any(
+                    f['severity'] == 'CRITICAL' for f in actions_poison_flags
+                ),
+                ai_config_poisoning_flags=len(ai_config_flags),
+                ai_config_poisoning_critical=any(
+                    f['severity'] == 'CRITICAL' for f in ai_config_flags
+                ),
             )
 
             # LAYER 5a: TEMPORAL DRIFT
@@ -586,12 +1242,34 @@ class PayloadAnalyzer:
                 critical_threshold=temporal_th["dangerous"],
             ).analyze_drift()
 
-            # LAYER 5b: SEMANTIC TRANSPARENCY
+            # LAYER 5b: SEMANTIC TRANSPARENCY (v2 — PR-MCI heuristic engine)
             semantic = SemanticTransparencyAnalyzer(
                 pr_description=pr_description,
-                actual_severity=verdict['severity'],
-                benign_keywords=self.config.semantic["benign_keywords"],
+                diffs=diffs,
+                config=self.config.semantic,
             ).analyze_transparency()
+
+            if semantic["status"] == "UNVERIFIED":
+                # INC-3: no PR description — cannot validate; SAFE upgrades to REVIEW
+                # so the gap is visible to reviewers without blocking the PR.
+                verdict["flags"].append("No PR description — semantic transparency unverified")
+                if verdict["status"] == "SAFE":
+                    verdict["status"] = "REVIEW"
+            elif semantic["status"] == "DECEPTIVE_PAYLOAD":
+                verdict["flags"].append(
+                    f"Semantic mismatch — description contradicts diff profile "
+                    f"(signals: {', '.join(semantic['signals'])})"
+                )
+                _escalate = {"SAFE": "CAUTION", "REVIEW": "CAUTION", "CAUTION": "DESTRUCTIVE"}
+                if verdict["status"] in _escalate:
+                    verdict["status"] = _escalate[verdict["status"]]
+            elif semantic["status"] == "CAUTION_MISMATCH":
+                verdict["flags"].append(
+                    f"Partial semantic mismatch — manual review advised "
+                    f"(signals: {', '.join(semantic['signals'])})"
+                )
+                if verdict["status"] == "SAFE":
+                    verdict["status"] = "REVIEW"
 
             # COMMIT MESSAGE ANALYSIS (advisory — §4.1)
             commit_flags: list[dict] = []
@@ -648,9 +1326,21 @@ class PayloadAnalyzer:
                     "max_deletion_ratio_pct": round(structural_score, 2),
                     "flagged_files": structural_flags[:10],
                 },
+                "complexity_advisory": complexity_advisory_all[:20],
+                "sca": sca_result,
                 "temporal_drift": temporal_drift,
                 "semantic": semantic,
                 "commit_flags": commit_flags,
+                "content_flags": added_file_flags,
+                "actions_poisoning": {
+                    "flagged_workflows": actions_poison_flags[:10],
+                    "total": len(actions_poison_flags),
+                },
+                "ai_config_poisoning": {
+                    "flagged_configs": ai_config_flags[:10],
+                    "total": len(ai_config_flags),
+                },
+                "mutable_tag_warnings": mutable_tag_warnings,
                 "permission_changes": permission_changes,
                 "special_files": special_files,
                 "deleted_files": {
@@ -658,6 +1348,7 @@ class PayloadAnalyzer:
                     "critical": critical_deletions[:10],
                     "all": deleted_files[:30],
                 },
+                "runtime_events": _load_runtime_events(),
             }
 
         except Exception as e:
@@ -666,7 +1357,40 @@ class PayloadAnalyzer:
                 "error_type": type(e).__name__,
             }
 
-    def _assess_consequence(self, files_deleted, lines_deleted, days_old, deletion_ratio, structural_severity="LOW", critical_file_deletions=0):
+    def _assess_consequence(
+        self,
+        files_deleted: int,
+        lines_deleted: int,
+        days_old: float,
+        deletion_ratio: float,
+        structural_severity: str = "LOW",
+        critical_file_deletions: int = 0,
+        security_file_deletions: int = 0,
+        unverified_dependencies: int = 0,
+        content_flags: int = 0,
+        actions_poisoning_flags: int = 0,
+        actions_poisoning_critical: bool = False,
+        ai_config_poisoning_flags: int = 0,
+        ai_config_poisoning_critical: bool = False,
+    ) -> dict:
+        """
+        Layer 3 consequence scoring -- assigns a severity verdict to the PR's deletion profile.
+
+        Returns a dict with keys: status, severity, severity_score, flags, recommendation.
+
+        Formal contracts are maintained in verification/consequence_pure.py and verified by
+        CrossHair. Invariants proven there:
+          - verdict in {SAFE, REVIEW, CAUTION, DESTRUCTIVE}
+          - severity_score in [0, 36]
+          - SAFE <-> severity_score < 1; DESTRUCTIVE <-> severity_score >= 5
+          - security_file_deletions > 0 -> DESTRUCTIVE
+          - structural_severity == CRITICAL -> DESTRUCTIVE
+          - actions_poisoning_critical -> DESTRUCTIVE
+          - ai_config_poisoning_critical -> DESTRUCTIVE
+          - all-zero inputs -> SAFE
+
+        Run: cd verification && crosshair check consequence_pure
+        """
         flags = []
         severity_score = 0.0
         th = self.config.thresholds
@@ -700,7 +1424,9 @@ class PayloadAnalyzer:
 
         # Ratio scoring only fires when absolute deletions reach a meaningful scale.
         # A 5-deleted / 15-added PR (25% ratio) is not a destructive changeset.
-        _RATIO_MIN_LINES = 100
+        # When critical-path files are deleted the bar drops to zero — a 45-line
+        # config deletion at 90% ratio IS significant regardless of volume.
+        _RATIO_MIN_LINES = 0 if critical_file_deletions > 0 else 100
         ratio_score = 0
         if lines_deleted >= _RATIO_MIN_LINES:
             if deletion_ratio > 90:
@@ -730,14 +1456,54 @@ class PayloadAnalyzer:
 
         if structural_severity == "CRITICAL":
             flags.append("Structural drift CRITICAL — significant class/function deletions detected")
-            severity_score += 3
+            severity_score += 5
 
         if critical_file_deletions > 5:
             flags.append(f"{critical_file_deletions} critical-path files deleted")
             severity_score += 2
         elif critical_file_deletions > 0:
             flags.append(f"{critical_file_deletions} critical-path file(s) deleted")
-            severity_score += 1
+            severity_score += 2
+
+        if security_file_deletions > 0:
+            flags.append(f"{security_file_deletions} security-critical file(s) deleted (auth/security/permission)")
+            severity_score += 5
+
+        if unverified_dependencies > 0:
+            flags.append(f"{unverified_dependencies} unverified package(s) added — not in allowlist.yml")
+            severity_score += 3
+
+        if content_flags > 0:
+            flags.append(f"{content_flags} added file(s) contain CI trigger strings or shell execution patterns")
+            severity_score += min(4, content_flags * 2)
+
+        actions_cfg = self.config.actions
+        if actions_poisoning_critical:
+            flags.append(
+                f"{actions_poisoning_flags} GitHub Actions workflow(s) contain critical "
+                f"poisoning signals (base64 payload / credential harvest)"
+            )
+            severity_score += actions_cfg.get("critical_signal_score", 5)
+        elif actions_poisoning_flags > 0:
+            flags.append(
+                f"{actions_poisoning_flags} GitHub Actions workflow(s) contain "
+                f"poisoning signals (elevated OIDC / dormant trigger / forged author)"
+            )
+            severity_score += actions_cfg.get("high_signal_score", 3)
+
+        if ai_config_poisoning_critical:
+            flags.append(
+                f"{ai_config_poisoning_flags} AI tooling config file(s) contain critical "
+                f"auto-execution poisoning signals (SessionStart hook / folder-open task / "
+                f"lifecycle script / binding.gyp)"
+            )
+            severity_score += actions_cfg.get("critical_signal_score", 5)
+        elif ai_config_poisoning_flags > 0:
+            flags.append(
+                f"{ai_config_poisoning_flags} AI tooling config file(s) contain "
+                f"execution or prompt-injection signals"
+            )
+            severity_score += actions_cfg.get("high_signal_score", 3)
 
         if severity_score >= 5:
             return {
@@ -771,6 +1537,409 @@ class PayloadAnalyzer:
                 "recommendation": "✓ Proceed with normal review process",
                 "severity_score": severity_score,
             }
+
+    def _scan_added_file_content(self, diffs):
+        """Scan added non-code files for CI trigger strings and shell execution patterns."""
+        flags = []
+        for d in diffs:
+            if d.change_type != 'A':
+                continue
+            path = d.b_path or ''
+            ext = Path(path).suffix.lower()
+            if ext in _CONTENT_SCAN_CODE_EXTENSIONS or ext in _CONTENT_BINARY_EXTENSIONS:
+                continue
+            # Workflow files are handled exclusively by L2c (_scan_github_actions_poisoning)
+            # to prevent double-counting scores from the same file.
+            if isinstance(path, str) and re.search(_ACTIONS_WORKFLOW_PATTERN, path):
+                continue
+            # AI tooling config files are handled exclusively by L2d (_scan_ai_tooling_configs).
+            if isinstance(path, str) and _AI_CONFIG_PATH_RE.search(path):
+                continue
+            try:
+                content = d.b_blob.data_stream.read().decode('utf-8', errors='replace')
+            except Exception:
+                continue
+            ci_matches = [p for p in _CONTENT_CI_TRIGGER_PATTERNS
+                          if re.search(p, content, re.IGNORECASE | re.MULTILINE)]
+            shell_matches = [p for p in _CONTENT_SHELL_PATTERNS
+                             if re.search(p, content, re.IGNORECASE | re.MULTILINE)]
+            if ci_matches or shell_matches:
+                flags.append({
+                    'file': path,
+                    'ci_triggers': ci_matches,
+                    'shell_patterns': shell_matches,
+                })
+        return flags
+
+    def _scan_ai_tooling_configs(self, diffs) -> list:
+        """Scan added and modified AI tooling config files for auto-execution poisoning signals."""
+        if not self.config.actions.get("enabled", True):
+            return []
+        flags = []
+        for d in diffs:
+            if d.change_type not in ('A', 'M'):
+                continue
+            path = d.b_path or d.a_path or ''
+            if not isinstance(path, str) or not _AI_CONFIG_PATH_RE.search(path):
+                continue
+            try:
+                content = d.b_blob.data_stream.read().decode('utf-8', errors='replace')
+            except Exception:
+                continue
+
+            filename = Path(path).name.lower()
+            signals = []
+
+            if filename == 'settings.json' and re.search(r'(^|/)\.(claude|gemini)/', path, re.IGNORECASE):
+                signals.extend(_check_agent_settings_json(content))
+            elif filename == 'tasks.json' and re.search(r'(^|/)\.vscode/', path, re.IGNORECASE):
+                signals.extend(_check_vscode_tasks(content))
+            elif path.lower().endswith('.mdc') and re.search(r'(^|/)\.cursor/rules/', path, re.IGNORECASE):
+                signals.extend(_check_cursor_rule(content))
+            elif filename == 'package.json':
+                signals.extend(_check_package_json_scripts(content))
+            elif filename == 'composer.json':
+                signals.extend(_check_composer_json(content))
+            elif filename == 'gemfile':
+                signals.extend(_check_gemfile(content))
+            elif filename == 'binding.gyp':
+                signals.extend(_check_binding_gyp(content))
+            elif filename == 'mcp.json':
+                signals.extend(_check_mcp_json(content))
+
+            if _HIDDEN_UNICODE_RE.search(content):
+                signals.append({'type': 'hidden_unicode', 'pattern': 'non-printing Unicode character'})
+
+            if signals:
+                _AI_CRITICAL_TYPES = {
+                    'command_in_session_hook', 'command_in_folder_open_task',
+                    'lifecycle_script_hijack', 'binding_gyp_command_substitution',
+                    'gemfile_system_call', 'composer_post_install',
+                }
+                severity = 'CRITICAL' if any(s['type'] in _AI_CRITICAL_TYPES for s in signals) else 'HIGH'
+                flags.append({'file': path, 'signals': signals, 'severity': severity})
+
+        return flags
+
+    def _scan_github_actions_poisoning(self, diffs) -> list:
+        """Scan added and modified GitHub Actions workflow files for poisoning signals."""
+        if not self.config.actions.get("enabled", True):
+            return []
+        flags = []
+        for path, content, d in _iter_workflow_file_diffs(diffs):
+            signals = []
+
+            # Fix 3: normalise folded/literal YAML block scalars to one line so
+            # patterns like 'base64 -d | bash' match even when split across lines.
+            # Only used for base64 checks — other checks depend on line structure.
+            normalized = _normalize_yaml_content(content)
+
+            # Signal 1: base64 payload — check both raw and normalised content so
+            # a payload entirely on one line is still caught without normalisation.
+            seen_b64 = False
+            for pat in _ACTIONS_BASE64_PAYLOAD:
+                if not seen_b64 and (
+                    re.search(pat, content, re.IGNORECASE | re.MULTILINE)
+                    or re.search(pat, normalized, re.IGNORECASE)
+                ):
+                    signals.append({'type': 'base64_payload', 'pattern': pat})
+                    seen_b64 = True  # one entry per file regardless of how many patterns match
+
+            for pat in _ACTIONS_CREDENTIAL_HARVEST:
+                if re.search(pat, content, re.IGNORECASE | re.MULTILINE) or \
+                   re.search(pat, normalized, re.IGNORECASE):
+                    signals.append({'type': 'credential_harvest', 'pattern': pat})
+
+            has_dormant_trigger = any(
+                re.search(p, content, re.IGNORECASE | re.MULTILINE)
+                for p in _ACTIONS_DORMANT_TRIGGER
+            )
+            has_shell_exec = any(
+                re.search(p, content, re.IGNORECASE | re.MULTILINE)
+                for p in _CONTENT_SHELL_PATTERNS
+            )
+            if has_dormant_trigger and has_shell_exec:
+                signals.append({'type': 'dormant_trigger_with_payload', 'pattern': 'composite'})
+
+            if _ACTIONS_FORGED_AUTHOR.search(content):
+                signals.append({'type': 'forged_bot_author', 'pattern': _ACTIONS_FORGED_AUTHOR.pattern})
+
+            if _ACTIONS_OIDC_ELEVATION_PATTERN.search(content):
+                # id-token: write detected - verify legitimate OIDC consumer.
+
+                # Extract all action references
+                actions_in_workflow = re.findall(
+                    r'uses:\s+([^\s@\n]+)',
+                    content,
+                    re.IGNORECASE
+                )
+
+                # Config-extended trusted consumers
+                config_trusted = self.config.actions.get("trusted_oidc_consumers", [])
+
+                # Check if any action is legitimate (built-in or config)
+                has_legitimate_consumer = any(
+                    _is_oidc_consumer_legitimate(action)
+                    or any(t in action for t in config_trusted)
+                    for action in actions_in_workflow
+                )
+
+                if has_legitimate_consumer:
+                    # Safe: id-token granted to trusted action
+                    pass
+                else:
+                    # No legitimate consumer - check for typosquat
+                    has_typosquat = any(
+                        _is_oidc_consumer_typosquatted(action)
+                        for action in actions_in_workflow
+                    )
+
+                    if has_typosquat:
+                        signals.append({
+                            'type': 'oidc_elevation_typosquatted',
+                            'pattern': 'id-token: write with typosquatted OIDC action',
+                            'risk': 'Deliberate impersonation of trusted cloud auth action',
+                            'severity': 'CRITICAL'
+                        })
+                    else:
+                        signals.append({
+                            'type': 'oidc_elevation_no_consumer',
+                            'pattern': 'id-token: write without safe OIDC consumer',
+                            'risk': 'Elevated permissions without legitimate use',
+                            'severity': 'HIGH'
+                        })
+
+            # Fix 1: pull_request_target as a standalone signal.
+            # Alone → HIGH: the trigger is sometimes legitimate (e.g. posting a
+            # comment from a fork PR). Combined with any write permission → CRITICAL
+            # because the workflow can both read secrets and modify the repository.
+            if _ACTIONS_DANGEROUS_TRIGGERS.search(content):
+                if _ACTIONS_WRITE_PERMISSIONS.search(content):
+                    signals.append({
+                        'type': 'pull_request_target_with_write_permissions',
+                        'pattern': 'pull_request_target + write permissions',
+                    })
+                else:
+                    signals.append({
+                        'type': 'dangerous_trigger_pull_request_target',
+                        'pattern': 'pull_request_target trigger',
+                    })
+
+            # Signal 7: GITHUB_ENV path/loader injection
+            if _ACTIONS_GITHUB_ENV_INJECTION.search(content):
+                signals.append({
+                    'type': 'github_env_injection',
+                    'pattern': _ACTIONS_GITHUB_ENV_INJECTION.pattern,
+                })
+
+            if signals:
+                critical_types = {
+                    'base64_payload',
+                    'credential_harvest',
+                    'pull_request_target_with_write_permissions',
+                    'oidc_elevation_typosquatted',
+                }
+                severity = 'CRITICAL' if any(s['type'] in critical_types for s in signals) else 'HIGH'
+                flags.append({
+                    'file': path,
+                    'signals': signals,
+                    'severity': severity,
+                    'change_type': d.change_type,
+                })
+        return flags
+
+
+def _iter_workflow_file_diffs(diffs):
+    """Yield (path, content, diff) for each added/modified workflow file in diffs."""
+    for d in diffs:
+        if d.change_type not in ('A', 'M'):
+            continue
+        path = d.b_path or d.a_path or ''
+        if not isinstance(path, str) or not re.search(_ACTIONS_WORKFLOW_PATTERN, path):
+            continue
+        try:
+            content = d.b_blob.data_stream.read().decode('utf-8', errors='replace')
+        except Exception:
+            continue
+        yield path, content, d
+
+
+def _scan_mutable_action_refs(diffs) -> list:
+    """Detect workflow `uses:` values not pinned to a 40-char SHA (advisory, no score impact)."""
+    _sha_re = re.compile(r'^[0-9a-f]{40}$', re.IGNORECASE)
+    warnings: list = []
+    for path, content, _ in _iter_workflow_file_diffs(diffs):
+        seen: set = set()
+        for line in content.splitlines():
+            m = re.match(r'\s+(?:-\s+)?uses:\s+([^\s#\n]+)', line)
+            if not m:
+                continue
+            raw = m.group(1).strip()
+            if raw.startswith('./') or raw.startswith('/') or '@' not in raw:
+                continue
+            action, ref = raw.rsplit('@', 1)
+            if _sha_re.match(ref) or raw in seen:
+                continue
+            seen.add(raw)
+            warnings.append({'file': path, 'action': action, 'ref': ref})
+    return warnings
+
+
+# ==============================================================================
+# AI TOOLING CONFIG POISONING — module-level helper functions (Layer 2d)
+# Each function inspects one config surface and returns a list of signal dicts.
+# ==============================================================================
+
+def _check_agent_settings_json(content: str) -> list:
+    """Return signals from .claude/settings.json or .gemini/settings.json hook commands."""
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    hooks_root = data.get('hooks', {})
+    if not isinstance(hooks_root, dict):
+        return []
+    signals = []
+    for event_name, hook_list in hooks_root.items():
+        if not isinstance(hook_list, list):
+            continue
+        for entry in hook_list:
+            if not isinstance(entry, dict):
+                continue
+            for hook in entry.get('hooks', []):
+                if not isinstance(hook, dict) or hook.get('type') != 'command':
+                    continue
+                cmd = hook.get('command', '')
+                if isinstance(cmd, str) and _AI_HOOK_CRITICAL_CMDS.search(cmd):
+                    signals.append({
+                        'type': 'command_in_session_hook',
+                        'event': event_name,
+                        'command': cmd[:200],
+                    })
+    return signals
+
+
+def _check_vscode_tasks(content: str) -> list:
+    """Return signals from .vscode/tasks.json folder-open tasks with critical commands."""
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    signals = []
+    for task in data.get('tasks', []):
+        if not isinstance(task, dict):
+            continue
+        if task.get('runOptions', {}).get('runOn') != 'folderOpen':
+            continue
+        cmd = task.get('command', '')
+        if isinstance(cmd, str) and _AI_HOOK_CRITICAL_CMDS.search(cmd):
+            signals.append({
+                'type': 'command_in_folder_open_task',
+                'label': task.get('label', ''),
+                'command': cmd[:200],
+            })
+    return signals
+
+
+def _check_cursor_rule(content: str) -> list:
+    """Return signals from .cursor/rules/*.mdc with alwaysApply + execute imperative."""
+    if not re.search(r'alwaysApply\s*:\s*true', content, re.IGNORECASE):
+        return []
+    if _CURSOR_EXEC_IMPERATIVE_RE.search(content):
+        return [{'type': 'cursor_nl_exec_imperative',
+                 'pattern': 'alwaysApply rule with execute imperative'}]
+    return []
+
+
+def _check_package_json_scripts(content: str) -> list:
+    """Return signals from package.json lifecycle scripts with critical commands."""
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    scripts = data.get('scripts', {})
+    if not isinstance(scripts, dict):
+        return []
+    signals = []
+    for key, cmd in scripts.items():
+        if key.lower() not in _PACKAGE_LIFECYCLE_KEYS:
+            continue
+        if isinstance(cmd, str) and _AI_HOOK_CRITICAL_CMDS.search(cmd):
+            signals.append({'type': 'lifecycle_script_hijack', 'script': key, 'command': cmd[:200]})
+    return signals
+
+
+def _check_composer_json(content: str) -> list:
+    """Return signals from composer.json lifecycle scripts with critical commands."""
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    scripts = data.get('scripts', {})
+    if not isinstance(scripts, dict):
+        return []
+    signals = []
+    for key, cmd_or_list in scripts.items():
+        if key.lower() not in _COMPOSER_LIFECYCLE_KEYS:
+            continue
+        for cmd in (cmd_or_list if isinstance(cmd_or_list, list) else [cmd_or_list]):
+            if isinstance(cmd, str) and _AI_HOOK_CRITICAL_CMDS.search(cmd):
+                signals.append({'type': 'composer_post_install', 'script': key, 'command': cmd[:200]})
+    return signals
+
+
+def _check_gemfile(content: str) -> list:
+    """Return signals from Gemfile top-level system/exec/backtick calls."""
+    if _GEMFILE_EXEC_RE.search(content):
+        return [{'type': 'gemfile_system_call', 'pattern': 'top-level system/exec/backtick'}]
+    return []
+
+
+def _check_binding_gyp(content: str) -> list:
+    """Return signals from binding.gyp command-substitution shell chains."""
+    if not _BINDING_GYP_CHAIN_RE.search(content):
+        return []
+    if _BINDING_GYP_SAFE_RE.search(content):
+        return []
+    return [{'type': 'binding_gyp_command_substitution', 'pattern': '<!(shell chain)'}]
+
+
+def _check_mcp_json(content: str) -> list:
+    """Return signals from mcp.json server entries running repo-local scripts."""
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    servers = data.get('mcpServers', data.get('servers', {}))
+    if not isinstance(servers, dict):
+        return []
+    signals = []
+    for name, srv in servers.items():
+        if not isinstance(srv, dict):
+            continue
+        cmd = srv.get('command', '')
+        args = srv.get('args', [])
+        if not isinstance(cmd, str):
+            continue
+        args_str = ' '.join(str(a) for a in (args if isinstance(args, list) else []))
+        full_cmd = f"{cmd} {args_str}".strip()
+        if (re.search(r'\b(node|python3?|bun)\b', cmd, re.IGNORECASE) and
+                re.search(r'(^|\s)\.(github|claude|gemini)/', full_cmd)):
+            signals.append({'type': 'mcp_local_server_command', 'server': name,
+                            'command': full_cmd[:200]})
+    return signals
+
+
+def _load_runtime_events() -> list:
+    """Load runtime events from the eBPF agent output file (advisory, no score impact)."""
+    import json as _json
+    import os as _os
+    path = _os.environ.get("PG_RUNTIME_EVENTS_PATH", "pg-runtime-events.json")
+    try:
+        with open(path) as f:
+            return [_json.loads(line) for line in f if line.strip()]
+    except (FileNotFoundError, _json.JSONDecodeError):
+        return []
 
 
 # ==============================================================================
@@ -829,6 +1998,22 @@ def print_report(report):
             for comp in f['deleted_components'][:5]:
                 print(f"      - {comp}")
 
+    complexity_advisory = report.get('complexity_advisory', [])
+    if complexity_advisory:
+        print(f"\n📐 COMPLEXITY ADVISORY ({len(complexity_advisory)} function(s) above threshold)")
+        for ca in complexity_advisory[:10]:
+            print(f"   {ca['file']}: {ca['name']}() — V(G)={ca['complexity']} (threshold: {ca['threshold']})")
+
+    sca = report.get('sca', {})
+    if sca.get('allowlist_active'):
+        print(f"\n📦 SCA — DEPENDENCY SCAN: {sca['status']}")
+        if sca['manifest_files_scanned']:
+            print(f"   Manifests scanned: {', '.join(sca['manifest_files_scanned'])}")
+        if sca['unverified_packages']:
+            print(f"   Unverified packages ({len(sca['unverified_packages'])}):")
+            for pkg in sca['unverified_packages'][:10]:
+                print(f"      - {pkg['package']} ({pkg['manifest']})")
+
     if 'temporal_drift' in report:
         td = report['temporal_drift']
         print(f"\n⏱  TEMPORAL DRIFT (Layer 5a)")
@@ -839,11 +2024,18 @@ def print_report(report):
 
     if 'semantic' in report:
         sem = report['semantic']
-        print(f"\n🔎 SEMANTIC TRANSPARENCY (Layer 5b)")
-        print(f"   Status: {sem['status']}")
-        if sem.get('matched_keyword'):
-            print(f"   Matched keyword: \"{sem['matched_keyword']}\"")
+        print(f"\n🔎 SEMANTIC TRANSPARENCY (Layer 5b) — {sem['status']}")
+        print(f"   MCI score: {sem.get('mci_score', 0.0):.3f}")
+        if sem.get('signals'):
+            print(f"   Signals:   {', '.join(sem['signals'])}")
         print(f"   {sem['directive']}")
+
+    ap = report.get('actions_poisoning', {})
+    if ap.get('total', 0) > 0:
+        print(f"\n🎯  GITHUB ACTIONS POISONING (Layer 2c) — {ap['total']} workflow(s) flagged")
+        for wf in ap.get('flagged_workflows', [])[:5]:
+            sig_types = ', '.join(s['type'] for s in wf['signals'])
+            print(f"   [{wf['severity']}] {wf['file']}: {sig_types}")
 
     commit_flags = report.get('commit_flags', [])
     if commit_flags:
@@ -1043,6 +2235,36 @@ def format_markdown_report(report: dict) -> str:
         out.append(f"_{struct_note}_")
         out.append("")
 
+    # ── Complexity Advisory ───────────────────────────────────────────────────
+    complexity_advisory = report.get('complexity_advisory', [])
+    if complexity_advisory:
+        out.append("### 📐 Complexity Advisory")
+        out.append("_Newly added Python functions with McCabe cyclomatic complexity above the configured threshold (default V(G) > 15). Advisory only — no score impact. High complexity functions are harder to test and maintain._")
+        out.append("")
+        out.append("| File | Function | V(G) | Threshold |")
+        out.append("|---|---|---|---|")
+        for ca in complexity_advisory[:10]:
+            out.append(f"| `{_md_escape(ca['file'])}` | `{ca['name']}` | {ca['complexity']} | {ca['threshold']} |")
+        out.append("")
+
+    # ── SCA ───────────────────────────────────────────────────────────────────
+    sca = report.get('sca', {})
+    if sca.get('allowlist_active'):
+        sca_emoji = "🚨" if sca['status'] == 'FLAGGED' else "✅"
+        out.append("### 📦 SCA — Dependency Scan (Layer 2b)")
+        out.append("_Scans manifest file changes (requirements.txt, package.json, go.mod, Cargo.toml, pyproject.toml) for packages not in `allowlist.yml`. Only active when `allowlist.yml` is present in the repo root._")
+        out.append("")
+        out.append(f"**Status:** {sca_emoji} `{sca['status']}`")
+        if sca['manifest_files_scanned']:
+            out.append(f"  \n**Manifests scanned:** {', '.join(f'`{_md_escape(m)}`' for m in sca['manifest_files_scanned'])}")
+        if sca['unverified_packages']:
+            out.append("")
+            out.append("| Package | Manifest | Type |")
+            out.append("|---|---|---|")
+            for pkg in sca['unverified_packages'][:20]:
+                out.append(f"| `{_md_escape(pkg['package'])}` | `{_md_escape(pkg['manifest'])}` | {pkg['manifest_type']} |")
+        out.append("")
+
     # ── Temporal Drift ────────────────────────────────────────────────────────
     if 'temporal_drift' in report:
         td = report['temporal_drift']
@@ -1064,13 +2286,13 @@ def format_markdown_report(report: dict) -> str:
     # ── Semantic Transparency ─────────────────────────────────────────────────
     if 'semantic' in report:
         sem = report['semantic']
-        sem_emoji = {"DECEPTIVE_PAYLOAD": "🚨", "UNVERIFIED": "⚠️"}.get(sem['status'], "✅")
+        sem_emoji = {"DECEPTIVE_PAYLOAD": "🚨", "CAUTION_MISMATCH": "⚠️", "UNVERIFIED": "⚠️"}.get(sem['status'], "✅")
         out.append("### 🔎 Semantic Transparency (Layer 5b)")
         out.append("_Compares the PR description against the verified severity. If the description uses low-impact language but the diff says otherwise, that's a deceptive payload pattern — the pattern at the centre of the April 2026 incident._")
         out.append("")
-        out.append(f"**Status:** {sem_emoji} `{sem['status']}`")
-        if sem.get('matched_keyword'):
-            out.append(f"  \n**Matched keyword:** `{sem['matched_keyword']}`")
+        out.append(f"**Status:** {sem_emoji} `{sem['status']}` &nbsp; **MCI score:** `{sem.get('mci_score', 0.0):.3f}`")
+        if sem.get('signals'):
+            out.append(f"  \n**Signals:** {', '.join(f'`{s}`' for s in sem['signals'])}")
         out.append(f"\n> {sem['directive']}")
         out.append("")
 
@@ -1086,6 +2308,47 @@ def format_markdown_report(report: dict) -> str:
         out.append("|---|---|")
         for cf in commit_flags[:10]:
             out.append(f"| `{cf['sha']}` | {_md_escape(cf['message'])} |")
+        out.append("")
+
+    # ── Added File Content Flags ──────────────────────────────────────────────
+    content_flags = report.get('content_flags', [])
+    if content_flags:
+        out.append("### 🔬 Added File Content Scan")
+        out.append("_Added non-code files scanned for CI trigger strings and shell execution patterns._")
+        out.append("")
+        out.append("| File | CI Triggers | Shell Patterns |")
+        out.append("|---|---|---|")
+        for cf in content_flags:
+            ci_cell = f"{len(cf['ci_triggers'])} match(es)" if cf['ci_triggers'] else "—"
+            sh_cell = f"{len(cf['shell_patterns'])} match(es)" if cf['shell_patterns'] else "—"
+            out.append(f"| `{_md_escape(cf['file'])}` | {ci_cell} | {sh_cell} |")
+        out.append("")
+
+    # ── GitHub Actions Poisoning ──────────────────────────────────────────────
+    ap = report.get('actions_poisoning', {})
+    if ap.get('total', 0) > 0:
+        ap_emoji = "🚨" if any(
+            wf['severity'] == 'CRITICAL' for wf in ap.get('flagged_workflows', [])
+        ) else "⚠️"
+        out.append("### 🎯 GitHub Actions Poisoning (Layer 2c)")
+        out.append(
+            "_Scans added and modified `.github/workflows/` and `.github/actions/` files for "
+            "poisoning signals: base64-encoded payload delivery, credential harvesting "
+            "(env dumps, metadata endpoint probing), dormant triggers with embedded shell "
+            "execution, forged bot commit identity, and elevated OIDC permissions without "
+            "a legitimate cloud consumer._"
+        )
+        out.append("")
+        out.append(f"**{ap_emoji} {ap['total']} workflow(s) flagged**")
+        out.append("")
+        out.append("| File | Signal types | Severity |")
+        out.append("|---|---|---|")
+        for wf in ap.get('flagged_workflows', []):
+            sig_types = ', '.join(f"`{s['type']}`" for s in wf['signals'])
+            sev_emoji = "🚨" if wf['severity'] == 'CRITICAL' else "⚠️"
+            out.append(
+                f"| `{_md_escape(wf['file'])}` | {sig_types} | {sev_emoji} {wf['severity']} |"
+            )
         out.append("")
 
     # ── Deleted Files ─────────────────────────────────────────────────────────
@@ -1165,7 +2428,6 @@ def main():
     parser.add_argument("--save-markdown", nargs="?", const="payloadguard-report.md",
                         metavar="FILE",
                         help="Save GitHub-flavoured markdown report (default: payloadguard-report.md)")
-
     args = parser.parse_args()
 
     config   = load_config(args.repo_path)
