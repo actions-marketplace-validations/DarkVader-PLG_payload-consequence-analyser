@@ -15,6 +15,13 @@ inputs:
     description: PR description for semantic transparency analysis — pass github.event.pull_request.body
     required: false
     default: ""
+  consequence-mode:
+    description: >
+      Consequence engine policy mode: shadow | advisory | enforce. Empty uses
+      consequence.mode from payloadguard.yml on the target branch (default shadow).
+      enforce sets exit code 2 on BLOCK findings.
+    required: false
+    default: ""
   save-markdown:
     description: Filename for the markdown report
     required: false
@@ -57,7 +64,7 @@ outputs:
     description: Absolute path to the generated JSON report
     value: ${{ steps.scan.outputs.json_report_path }}
   verdict:
-    description: "Verdict string: SAFE, REVIEW, CAUTION, or DESTRUCTIVE"
+    description: "Verdict string: SAFE, REVIEW, CAUTION, or DESTRUCTIVE (ERROR when the analysis failed)"
     value: ${{ steps.scan.outputs.verdict }}
   runtime-events-path:
     description: Path to pg-runtime-events.json (only set when runtime-mode != disabled)
@@ -73,53 +80,87 @@ runs:
 
     - name: Install dependencies
       shell: bash
-      run: pip install -r "${{ github.action_path }}/requirements.txt"
+      run: pip install -r "$GITHUB_ACTION_PATH/requirements.txt"
 
     - name: Fetch base branch
       shell: bash
-      run: git fetch origin ${{ github.base_ref }}:${{ github.base_ref }}
+      # PG_BASE_REF is passed through the environment rather than interpolated
+      # into the script body. Actions substitutes ${{ }} before bash parses the
+      # line, so a branch name containing shell metacharacters would otherwise
+      # be executed as code. See also the scan step below.
+      env:
+        PG_BASE_REF: ${{ github.base_ref }}
+      run: git fetch origin "$PG_BASE_REF":"$PG_BASE_REF"
 
     - name: PayloadGuard Runtime Agent
       id: runtime
       if: inputs.runtime-mode != 'disabled'
       shell: bash
+      env:
+        PG_RUNTIME_MODE: ${{ inputs.runtime-mode }}
       run: |
         PG_VERSION=v2.0.0
         ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
-        EVENTS_PATH="${{ github.workspace }}/pg-runtime-events.json"
+        EVENTS_PATH="${GITHUB_WORKSPACE}/pg-runtime-events.json"
         curl -fsSL \
           "https://github.com/PayloadGuard-PLG/payload-consequence-analyser/releases/download/${PG_VERSION}/pg-agent-linux-${ARCH}" \
           -o /tmp/pg-agent && chmod +x /tmp/pg-agent
         sudo /tmp/pg-agent \
-          --mode=${{ inputs.runtime-mode }} \
-          --policy="${{ github.workspace }}/payloadguard-policy.yaml" \
+          --mode="$PG_RUNTIME_MODE" \
+          --policy="${GITHUB_WORKSPACE}/payloadguard-policy.yaml" \
           --out="${EVENTS_PATH}" &
         echo "events_path=${EVENTS_PATH}" >> "$GITHUB_OUTPUT"
 
     - name: Run PayloadGuard
       id: scan
       shell: bash
+      # The PR head is scanned by commit. A fork PR's head branch does not exist
+      # in this repository, and a same-named branch here (e.g. main) is not the
+      # PR. github.head_ref remains the fallback for non pull_request events.
       env:
         PYTHONUTF8: "1"
         PG_PR_DESCRIPTION: ${{ inputs.pr-description }}
+        PG_CONSEQUENCE_MODE: ${{ inputs.consequence-mode }}
+        PG_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PG_HEAD_REF: ${{ github.head_ref }}
+        PG_BASE_REF: ${{ github.base_ref }}
         REPORT_PATH: ${{ github.workspace }}/${{ inputs.save-markdown }}
         JSON_REPORT_PATH: ${{ github.workspace }}/payloadguard-report.json
       run: |
         set +e
-        python "${{ github.action_path }}/analyze.py" . \
-          "${{ github.head_ref }}" "${{ github.base_ref }}" \
-          --pr-description "$PG_PR_DESCRIPTION" \
-          --save-markdown "$REPORT_PATH" \
-          --save-json "$JSON_REPORT_PATH"
-        EXIT=$?
+        # Validate the mode here: an argparse usage error exits 2, which would
+        # read as DESTRUCTIVE.
+        MODE_ARGS=()
+        case "$PG_CONSEQUENCE_MODE" in
+          "") ;;
+          shadow|advisory|enforce) MODE_ARGS=(--consequence-mode "$PG_CONSEQUENCE_MODE") ;;
+          *) MODE_INVALID=1 ;;
+        esac
+        if [ -n "$MODE_INVALID" ]; then
+          echo "::error::consequence-mode must be one of: shadow, advisory, enforce"
+          EXIT=1
+        else
+          python "$GITHUB_ACTION_PATH/analyze.py" . \
+            "${PG_HEAD_SHA:-$PG_HEAD_REF}" "$PG_BASE_REF" \
+            --pr-description "$PG_PR_DESCRIPTION" \
+            --save-markdown "$REPORT_PATH" \
+            --save-json "$JSON_REPORT_PATH" \
+            "${MODE_ARGS[@]}"
+          EXIT=$?
+        fi
         echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
         echo "report_path=$REPORT_PATH" >> "$GITHUB_OUTPUT"
         echo "json_report_path=$JSON_REPORT_PATH" >> "$GITHUB_OUTPUT"
-        case $EXIT in
-          0) echo "verdict=SAFE"        >> "$GITHUB_OUTPUT" ;;
-          2) echo "verdict=DESTRUCTIVE" >> "$GITHUB_OUTPUT" ;;
-          *) echo "verdict=ERROR"       >> "$GITHUB_OUTPUT" ;;
-        esac
+        # Exit 0 covers SAFE, REVIEW and CAUTION; the JSON report carries the verdict.
+        VERDICT=ERROR
+        if [ "$EXIT" = 0 ] || [ "$EXIT" = 2 ]; then
+          VERDICT=$(python -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["verdict"]["status"])' "$JSON_REPORT_PATH" 2>/dev/null)
+          case "$VERDICT" in
+            SAFE|REVIEW|CAUTION|DESTRUCTIVE) ;;
+            *) if [ "$EXIT" = 2 ]; then VERDICT=DESTRUCTIVE; else VERDICT=SAFE; fi ;;
+          esac
+        fi
+        echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
 
     - name: Post PR comment
       if: always()
@@ -169,7 +210,7 @@ runs:
         JSON_REPORT_PATH: ${{ steps.scan.outputs.json_report_path }}
         PR_BASE_BRANCH: ${{ github.base_ref }}
         REPO_FULL_NAME: ${{ github.repository }}
-      run: python "${{ github.action_path }}/remediate.py"
+      run: python "$GITHUB_ACTION_PATH/remediate.py"
 
     - name: Post Check Run
       if: always()
@@ -181,4 +222,4 @@ runs:
         PAYLOADGUARD_EXIT_CODE: ${{ steps.scan.outputs.exit_code }}
         PAYLOADGUARD_REPORT_PATH: ${{ steps.scan.outputs.report_path }}
         PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      run: python "${{ github.action_path }}/post_check_run.py"
+      run: python "$GITHUB_ACTION_PATH/post_check_run.py"

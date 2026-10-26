@@ -1,6 +1,9 @@
 import json
 import os
 import re
+import shutil
+import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -29,6 +32,7 @@ from analyze import (
     _is_oidc_consumer_typosquatted,
     _load_allowlist,
     _parse_added_packages,
+    _read_file_at_ref,
     load_config,
     print_report,
     save_json_report,
@@ -701,6 +705,21 @@ class TestTemporalDriftAnalyzer(unittest.TestCase):
     def test_negative_velocity_raises(self):
         with self.assertRaises(ValueError):
             TemporalDriftAnalyzer(10, -1.0).analyze_drift()
+
+    # AUDIT_LOG §V10: 0 * inf is NaN, which compares below every threshold and was
+    # classified CURRENT. Non-finite inputs are rejected like negative ones.
+
+    def test_infinite_velocity_raises(self):
+        with self.assertRaises(ValueError):
+            TemporalDriftAnalyzer(0, float("inf")).analyze_drift()
+
+    def test_nan_velocity_raises(self):
+        with self.assertRaises(ValueError):
+            TemporalDriftAnalyzer(10, float("nan")).analyze_drift()
+
+    def test_infinite_age_raises(self):
+        with self.assertRaises(ValueError):
+            TemporalDriftAnalyzer(float("inf"), 1.0).analyze_drift()
 
     def test_drift_score_calculated_correctly(self):
         result = TemporalDriftAnalyzer(30, 4.0).analyze_drift()
@@ -3011,6 +3030,741 @@ class TestAIToolingConfigPoisoning(unittest.TestCase):
                                   ai_config_poisoning_critical=False)
         self.assertEqual(v["status"], "SAFE")
         self.assertEqual(v["severity_score"], 0)
+
+
+# ==============================================================================
+# Self-audit: PayloadGuard's own workflows must not be template-injectable
+# ==============================================================================
+
+# Contexts an outside party can influence on a pull_request event. A branch name
+# or PR title reaching a `run:` body is executed as shell, because Actions
+# substitutes ${{ }} before bash parses the script. Values must travel through
+# `env:` and be dereferenced as quoted shell variables instead.
+_UNTRUSTED_CONTEXT_RE = re.compile(
+    r"\$\{\{[^}]*\b(?:"
+    r"github\.head_ref|github\.base_ref|github\.ref|github\.ref_name|"
+    r"github\.actor|github\.triggering_actor|"
+    r"github\.event\.(?:pull_request|issue|comment|review|head_commit|workflow_run)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_ACTION_FILES = ("action.yml",)
+_WORKFLOW_DIR = ".github/workflows"
+
+
+def _iter_run_bodies():
+    """Yield (path, step_name, run_body) for every step with a `run:` in this repo."""
+    import glob
+
+    import yaml
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    paths = [os.path.join(root, f) for f in _ACTION_FILES]
+    paths += sorted(glob.glob(os.path.join(root, _WORKFLOW_DIR, "*.yml")))
+    paths += sorted(glob.glob(os.path.join(root, _WORKFLOW_DIR, "*.yaml")))
+
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as fh:
+            doc = yaml.safe_load(fh) or {}
+
+        step_groups = []
+        runs = doc.get("runs")
+        if isinstance(runs, dict) and isinstance(runs.get("steps"), list):
+            step_groups.append(runs["steps"])
+        jobs = doc.get("jobs")
+        if isinstance(jobs, dict):
+            for job in jobs.values():
+                if isinstance(job, dict) and isinstance(job.get("steps"), list):
+                    step_groups.append(job["steps"])
+
+        rel = os.path.relpath(path, root)
+        for steps in step_groups:
+            for step in steps:
+                if isinstance(step, dict) and isinstance(step.get("run"), str):
+                    yield rel, step.get("name", "<unnamed>"), step["run"]
+
+
+class TestOwnWorkflowsNotInjectable(unittest.TestCase):
+    """Regression guard for the template-injection class in this repo's own CI.
+
+    PayloadGuard's L2c layer does not yet detect this class in the diffs it
+    scans, so this test is the only thing preventing reintroduction here.
+    """
+
+    def test_no_untrusted_context_in_any_run_body(self):
+        offenders = [
+            f"{path} :: {name} :: {m.group(0)}"
+            for path, name, body in _iter_run_bodies()
+            for m in [_UNTRUSTED_CONTEXT_RE.search(body)]
+            if m
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "Attacker-influenced context interpolated into a run: body. Move the "
+            "value into the step's env: block and dereference it as a quoted "
+            "shell variable, e.g. PG_HEAD_REF: ${{ github.head_ref }} then "
+            '"$PG_HEAD_REF". Offenders:\n  ' + "\n  ".join(offenders),
+        )
+
+    def test_scanner_finds_a_planted_offender(self):
+        """The guard above is only meaningful if the pattern actually matches."""
+        planted = 'python analyze.py . "${{ github.head_ref }}" main'
+        self.assertIsNotNone(_UNTRUSTED_CONTEXT_RE.search(planted))
+        safe = 'python analyze.py . "$PG_HEAD_REF" "$PG_BASE_REF"'
+        self.assertIsNone(_UNTRUSTED_CONTEXT_RE.search(safe))
+
+    def test_run_body_iterator_finds_steps(self):
+        """Guard against the audit silently passing because nothing was scanned."""
+        bodies = list(_iter_run_bodies())
+        self.assertGreater(len(bodies), 5)
+        self.assertIn("action.yml", {path for path, _, _ in bodies})
+
+
+# ==============================================================================
+# POLICY TRUST BOUNDARY (AUDIT_LOG §V1)
+# ==============================================================================
+# payloadguard.yml and allowlist.yml must come from the target branch. In CI the
+# working tree is the PR merge result, so a working-tree read lets the PR under
+# scan set the policy that judges it.
+
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+_ANALYZE_PY = os.path.join(_REPO_ROOT, "analyze.py")
+_ACTION_YML = os.path.join(_REPO_ROOT, "action.yml")
+
+_POLICY_AUTH = '''class Auth:
+    def verify(self, password, hashed):
+        digest = hash_pw(password)
+        if not compare(digest, hashed):
+            return False
+        log_access(password)
+        return True
+
+
+def hash_pw(p):
+    return p[::-1]
+
+
+def compare(a, b):
+    return a == b
+
+
+def log_access(p):
+    print("access", len(p))
+'''
+_POLICY_AUTH_GUTTED = _POLICY_AUTH.replace(
+    "        digest = hash_pw(password)\n"
+    "        if not compare(digest, hashed):\n"
+    "            return False\n"
+    "        log_access(password)\n",
+    "",
+)
+_POLICY_ENFORCE = "consequence:\n  mode: enforce\n"
+_POLICY_SHADOW = "consequence:\n  mode: shadow\n"
+_POLICY_README_EDIT = {"README.md": "Fixture\n\nUsage notes for the login helper.\n"}
+
+
+def _policy_base_files():
+    files = {
+        "auth.py": _POLICY_AUTH,
+        "app.py": "from auth import Auth\n\n\ndef login(p, h):\n    return Auth().verify(p, h)\n",
+        "requirements.txt": "requests\n",
+        "allowlist.yml": "python:\n  - requests\n",
+        "payloadguard.yml": _POLICY_ENFORCE,
+        "README.md": "Fixture\n",
+    }
+    for i in range(1, 12):
+        files[f"data/record_{i:02d}.txt"] = f"record {i}\n"
+    return files
+
+
+def _fixture_env():
+    env = dict(os.environ)
+    env.update({
+        "GIT_AUTHOR_NAME": "PayloadGuard Test",
+        "GIT_AUTHOR_EMAIL": "test@payloadguard.local",
+        "GIT_COMMITTER_NAME": "PayloadGuard Test",
+        "GIT_COMMITTER_EMAIL": "test@payloadguard.local",
+        "PYTHONUTF8": "1",
+    })
+    return env
+
+
+def _run_git(cwd, *args):
+    return subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main", *args],
+        cwd=cwd, env=_fixture_env(), check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _commit_files(repo, files, message):
+    """Write {relpath: text} into repo (None deletes) and commit everything."""
+    for rel, text in files.items():
+        path = os.path.join(repo, rel)
+        if text is None:
+            os.remove(path)
+            continue
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+    _run_git(repo, "add", "-A")
+    _run_git(repo, "commit", "-q", "-m", message)
+
+
+def _force_rmtree(path):
+    """rmtree that also clears git's read-only object files on Windows."""
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                os.chmod(os.path.join(root, name), stat.S_IREAD | stat.S_IWRITE)
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+class TestPolicyReadFromTargetBranch(unittest.TestCase):
+    """CLI end to end (analyze.py main → verdict → exit code) on a real git fixture.
+
+    Each scan runs with the PR branch checked out, as CI does, while the base
+    branch carries `consequence.mode: enforce` and an allowlist.
+    """
+
+    PR_BRANCHES = {
+        # Control: destructive change under the base policy.
+        "pr/gut-verify": ("Tidy auth module", {"auth.py": _POLICY_AUTH_GUTTED}),
+        # Same change, plus the PR downgrading its own consequence mode.
+        "pr/gut-verify-shadow": ("Tidy auth module", {
+            "auth.py": _POLICY_AUTH_GUTTED,
+            "payloadguard.yml": _POLICY_SHADOW,
+        }),
+        # 11 file deletions, plus the PR raising the deletion thresholds out of reach.
+        "pr/delete-raise-thresholds": ("Remove stale records", dict(
+            {f"data/record_{i:02d}.txt": None for i in range(1, 12)},
+            **{"payloadguard.yml": _POLICY_ENFORCE + "thresholds:\n  files_deleted: [100000, 200000, 300000]\n"},
+        )),
+        # Unvetted dependency, plus the PR allowlisting it.
+        "pr/allowlist-self-approve": ("Add HTTP helper dependency", {
+            "requirements.txt": "requests\nevilpkg\n",
+            "allowlist.yml": "python:\n  - requests\n  - evilpkg\n",
+        }),
+        # Legitimate change under the base policy.
+        "pr/docs": ("Document login helper usage", _POLICY_README_EDIT),
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="pg_policy_")
+        cls.repo = os.path.join(cls.tmp, "repo")
+        os.makedirs(cls.repo)
+        _run_git(cls.repo, "init", "-q")
+        _commit_files(cls.repo, _policy_base_files(), "base")
+        for branch, (_desc, files) in cls.PR_BRANCHES.items():
+            _run_git(cls.repo, "checkout", "-q", "-b", branch, "main")
+            _commit_files(cls.repo, files, f"change on {branch}")
+        cls.results = {branch: cls._scan(branch, desc) for branch, (desc, _f) in cls.PR_BRANCHES.items()}
+
+    @classmethod
+    def tearDownClass(cls):
+        _force_rmtree(cls.tmp)
+
+    @classmethod
+    def _scan(cls, branch, description, extra_args=(), extra_env=None, tag=""):
+        _run_git(cls.repo, "checkout", "-q", "--detach", branch)
+        report_path = os.path.join(cls.tmp, branch.replace("/", "_") + tag + ".json")
+        env = _fixture_env()
+        env.pop("PAYLOADGUARD_CONSEQUENCE_MODE", None)
+        env.update(extra_env or {})
+        proc = subprocess.run(
+            [sys.executable, _ANALYZE_PY, cls.repo, branch, "main",
+             "--pr-description", description, "--save-json", report_path, *extra_args],
+            env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        if not os.path.exists(report_path):
+            raise AssertionError(f"no report for {branch}:\n{proc.stdout}\n{proc.stderr}")
+        with open(report_path, encoding="utf-8") as fh:
+            return proc.returncode, json.load(fh)
+
+    def test_control_destructive_change_blocks_under_base_policy(self):
+        code, rep = self.results["pr/gut-verify"]
+        self.assertEqual(rep["consequence_analysis"]["mode"], "enforce")
+        self.assertEqual(rep["verdict"]["status"], "DESTRUCTIVE")
+        self.assertEqual(code, 2)
+
+    def test_pr_cannot_downgrade_its_own_consequence_mode(self):
+        code, rep = self.results["pr/gut-verify-shadow"]
+        self.assertEqual(rep["consequence_analysis"]["mode"], "enforce")
+        self.assertEqual(rep["verdict"]["status"], "DESTRUCTIVE")
+        self.assertEqual(code, 2)
+
+    def test_pr_cannot_raise_its_own_thresholds(self):
+        _code, rep = self.results["pr/delete-raise-thresholds"]
+        self.assertIn("11 files would be deleted", rep["verdict"]["flags"])
+        self.assertGreaterEqual(rep["verdict"]["severity_score"], 1)
+
+    def test_pr_cannot_allowlist_its_own_dependency(self):
+        _code, rep = self.results["pr/allowlist-self-approve"]
+        flagged = [p["package"] for p in rep["sca"]["unverified_packages"]]
+        self.assertEqual(flagged, ["evilpkg"])
+
+    def test_legitimate_change_passes_under_base_policy(self):
+        code, rep = self.results["pr/docs"]
+        self.assertEqual(rep["consequence_analysis"]["mode"], "enforce")
+        self.assertEqual(rep["consequence_analysis"]["findings"], [])
+        self.assertTrue(rep["sca"]["allowlist_active"])
+        self.assertEqual(rep["verdict"]["status"], "SAFE")
+        self.assertEqual(code, 0)
+
+    def test_verdict_exit_code_survives_non_utf8_stdout(self):
+        """AUDIT_LOG §V11: the console report contains symbols outside cp1252 (the
+        stdout encoding of redirected output on Windows). The encoding error used to
+        replace the verdict's exit code with 1 before any report was written."""
+        _run_git(self.repo, "checkout", "-q", "--detach", "pr/gut-verify")
+        report_path = os.path.join(self.tmp, "gut-verify_cp1252.json")
+        env = _fixture_env()
+        env.pop("PYTHONUTF8", None)
+        env["PYTHONIOENCODING"] = "cp1252"
+        proc = subprocess.run(
+            [sys.executable, _ANALYZE_PY, self.repo, "pr/gut-verify", "main",
+             "--pr-description", "Tidy auth module", "--save-json", report_path],
+            env=env, capture_output=True,
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr.decode("cp1252", errors="replace")[-2000:])
+        self.assertIn(b"VERDICT: DESTRUCTIVE", proc.stdout)
+        self.assertTrue(os.path.exists(report_path))
+
+    # AUDIT_LOG §V6: --consequence-mode > PAYLOADGUARD_CONSEQUENCE_MODE > payloadguard.yml.
+
+    def test_cli_flag_takes_precedence_over_env_mode(self):
+        code, rep = self._scan(
+            "pr/gut-verify", "Tidy auth module", extra_args=("--consequence-mode", "shadow"),
+            extra_env={"PAYLOADGUARD_CONSEQUENCE_MODE": "enforce"}, tag="_flag",
+        )
+        self.assertEqual(rep["consequence_analysis"]["mode"], "shadow")
+        self.assertEqual(code, 0)
+
+    def test_env_mode_still_overrides_policy_file(self):
+        code, rep = self._scan(
+            "pr/gut-verify", "Tidy auth module",
+            extra_env={"PAYLOADGUARD_CONSEQUENCE_MODE": "advisory"}, tag="_env",
+        )
+        self.assertEqual(rep["consequence_analysis"]["mode"], "advisory")
+        self.assertEqual(code, 0)
+
+    def test_load_config_ref_reads_commit_not_working_tree(self):
+        _run_git(self.repo, "checkout", "-q", "--detach", "pr/gut-verify-shadow")
+        # Without a ref the legacy working-tree contract is unchanged.
+        self.assertEqual(load_config(self.repo).consequence["mode"], "shadow")
+        self.assertEqual(load_config(self.repo, ref="main").consequence["mode"], "enforce")
+
+    def test_policy_ref_falls_back_to_origin(self):
+        """CI checkouts can carry the target only as origin/<ref> on a detached HEAD."""
+        clone = os.path.join(self.tmp, "clone")
+        _run_git(self.repo, "checkout", "-q", "main")
+        _run_git(self.tmp, "clone", "-q", self.repo, clone)
+        _run_git(clone, "checkout", "-q", "--detach", "origin/pr/allowlist-self-approve")
+        _run_git(clone, "branch", "-q", "-D", "main")
+        self.assertEqual(load_config(clone, ref="main").consequence["mode"], "enforce")
+        self.assertEqual(_load_allowlist(clone, ref="main"), {"python": {"requests"}})
+
+    def test_policy_ref_missing_file_or_ref_returns_defaults(self):
+        self.assertIsNone(_read_file_at_ref(self.repo, "main", "absent.yml"))
+        self.assertIsNone(_load_allowlist(self.repo, ref="no-such-branch"))
+        self.assertEqual(load_config(self.repo, ref="no-such-branch").consequence["mode"], "shadow")
+        self.assertEqual(load_config(os.path.join(self.tmp, "missing"), ref="main").consequence["mode"], "shadow")
+
+
+def _find_bash():
+    """Locate bash for running action.yml steps; on Windows use Git for Windows, not the WSL launcher."""
+    if os.name != "nt":
+        return shutil.which("bash")
+    git_exe = shutil.which("git")
+    if not git_exe:
+        return None
+    parent = os.path.dirname(git_exe)
+    for _ in range(3):
+        candidate = os.path.join(parent, "bin", "bash.exe")
+        if os.path.exists(candidate):
+            return candidate
+        parent = os.path.dirname(parent)
+    return None
+
+
+class TestActionPolicyTrustBoundary(unittest.TestCase):
+    """action.yml end to end on a local reproduction of a pull_request checkout.
+
+    Recreates what actions/checkout (fetch-depth: 0) leaves for a pull_request
+    event: origin/* branches, a refs/remotes/pull/1/merge merge commit and a
+    detached HEAD. Then runs the `run:` bodies of the "Fetch base branch" and
+    "Run PayloadGuard" steps verbatim in bash and reads $GITHUB_OUTPUT.
+    """
+
+    STEPS = ("Fetch base branch", "Run PayloadGuard")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bash = _find_bash()
+        if cls.bash is None:
+            raise unittest.SkipTest("bash is required to execute action.yml run steps")
+        cls.tmp = tempfile.mkdtemp(prefix="pg_action_")
+        cls.upstream = os.path.join(cls.tmp, "upstream.git")
+        _run_git(cls.tmp, "init", "-q", "--bare", cls.upstream)
+        cls.seed = os.path.join(cls.tmp, "seed")
+        _run_git(cls.tmp, "clone", "-q", cls.upstream, cls.seed)
+        _run_git(cls.seed, "checkout", "-q", "-B", "main")
+        _commit_files(cls.seed, _policy_base_files(), "base")
+        _run_git(cls.seed, "push", "-q", "origin", "main")
+        # The run body invokes `python`; point it at this interpreter.
+        shim_dir = os.path.join(cls.tmp, "bin")
+        os.makedirs(shim_dir)
+        shim = os.path.join(shim_dir, "python")
+        with open(shim, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write('#!/usr/bin/env bash\nexec "%s" "$@"\n' % sys.executable.replace("\\", "/"))
+        os.chmod(shim, 0o755)
+        cls.shim_dir = shim_dir
+
+    @classmethod
+    def tearDownClass(cls):
+        _force_rmtree(cls.tmp)
+
+    def _pr_scan(self, name, head_repo, head_branch, files, description, event_head_sha=True,
+                 consequence_mode=""):
+        """Commit files on head_branch in head_repo, check the PR out as CI does, run the scan steps.
+
+        event_head_sha=False leaves github.event.pull_request.head.sha empty, as on
+        events without a pull_request payload. consequence_mode is the action's
+        `consequence-mode` input.
+        """
+        import yaml
+
+        _run_git(head_repo, "checkout", "-q", "-B", head_branch, "origin/main")
+        _commit_files(head_repo, files, description or f"change on {head_branch}")
+        if head_repo == self.seed:
+            _run_git(head_repo, "push", "-q", "origin", head_branch)
+
+        ci = os.path.join(self.tmp, name)
+        os.makedirs(ci)
+        _run_git(ci, "init", "-q")
+        _run_git(ci, "remote", "add", "origin", self.upstream)
+        _run_git(ci, "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+        _run_git(ci, "fetch", "-q", head_repo, f"+refs/heads/{head_branch}:refs/remotes/pull/1/head")
+        head_sha = _run_git(ci, "rev-parse", "refs/remotes/pull/1/head")
+        _run_git(ci, "checkout", "-q", "--detach", "origin/main")
+        _run_git(ci, "merge", "-q", "--no-ff", "-m", "Merge pull request #1", head_sha)
+        _run_git(ci, "update-ref", "refs/remotes/pull/1/merge", "HEAD")
+        _run_git(ci, "update-ref", "-d", "refs/remotes/pull/1/head")
+        _run_git(ci, "checkout", "-q", "--detach", "refs/remotes/pull/1/merge")
+
+        workspace = ci.replace("\\", "/")
+        context = {
+            "github.base_ref": "main",
+            "github.head_ref": head_branch,
+            "github.workspace": workspace,
+            "github.event.pull_request.head.sha": head_sha if event_head_sha else "",
+            "inputs.pr-description": description,
+            "inputs.save-markdown": "payloadguard-report.md",
+            "inputs.consequence-mode": consequence_mode,
+        }
+
+        def expand(value):
+            return re.sub(r"\$\{\{\s*(.+?)\s*\}\}", lambda m: context[m.group(1)], str(value))
+
+        output = os.path.join(ci, "github_output")
+        open(output, "w").close()
+        env = _fixture_env()
+        env.update({
+            "GITHUB_ACTION_PATH": _REPO_ROOT.replace("\\", "/"),
+            "GITHUB_OUTPUT": output.replace("\\", "/"),
+            "GITHUB_WORKSPACE": workspace,
+            "PATH": self.shim_dir + os.pathsep + env.get("PATH", ""),
+        })
+        with open(_ACTION_YML, encoding="utf-8") as fh:
+            steps = yaml.safe_load(fh)["runs"]["steps"]
+        ran = []
+        for step in steps:
+            if step.get("name") not in self.STEPS:
+                continue
+            step_env = dict(env, **{k: expand(v) for k, v in (step.get("env") or {}).items()})
+            proc = subprocess.run(
+                [self.bash, "--noprofile", "--norc", "-eo", "pipefail", "-c", step["run"]],
+                cwd=ci, env=step_env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            self.assertEqual(proc.returncode, 0, f"{step['name']} failed:\n{proc.stdout}\n{proc.stderr}")
+            ran.append(step["name"])
+        self.assertEqual(tuple(ran), self.STEPS)
+
+        with open(output, encoding="utf-8") as fh:
+            outputs = dict(line.split("=", 1) for line in fh.read().splitlines() if "=" in line)
+        report_path = os.path.join(ci, "payloadguard-report.json")
+        report = {}
+        if os.path.exists(report_path):
+            with open(report_path, encoding="utf-8") as fh:
+                report = json.load(fh)
+        return outputs, report, head_sha
+
+    def test_pr_policy_downgrade_still_blocks_through_action(self):
+        outputs, report, _ = self._pr_scan(
+            "self-disable", self.seed, "feature/quiet",
+            {"auth.py": _POLICY_AUTH_GUTTED, "payloadguard.yml": _POLICY_SHADOW}, "Tidy auth module",
+        )
+        self.assertEqual(report["consequence_analysis"]["mode"], "enforce")
+        self.assertEqual(outputs["exit_code"], "2")
+        self.assertEqual(outputs["verdict"], "DESTRUCTIVE")
+
+    def test_legitimate_pr_passes_through_action(self):
+        outputs, report, _ = self._pr_scan(
+            "benign", self.seed, "feature/docs", _POLICY_README_EDIT, "Document login helper usage",
+        )
+        self.assertEqual(report["consequence_analysis"]["mode"], "enforce")
+        self.assertEqual(outputs["exit_code"], "0")
+        self.assertEqual(outputs["verdict"], "SAFE")
+
+    def _fork(self, name):
+        fork = os.path.join(self.tmp, name)
+        _run_git(self.tmp, "clone", "-q", self.upstream, fork)
+        return fork
+
+    # AUDIT_LOG §V2: the head must be resolved from the PR head commit. A fork's
+    # branch does not exist in the base repository, and a same-named one does.
+
+    def test_fork_pr_from_colliding_branch_name_scans_the_pr_head(self):
+        """A fork PR from the fork's `main` previously diffed the base `main` against itself."""
+        outputs, report, head_sha = self._pr_scan(
+            "fork-main", self._fork("fork-a"), "main", {"auth.py": _POLICY_AUTH_GUTTED}, "Tidy auth module",
+        )
+        self.assertEqual(report["temporal"]["branch_commit_hash"], head_sha[:7])
+        self.assertEqual(outputs["exit_code"], "2")
+        self.assertEqual(outputs["verdict"], "DESTRUCTIVE")
+
+    def test_fork_pr_from_fork_only_branch_scans_the_pr_head(self):
+        """A fork PR from a branch absent in the base repository previously exited 1."""
+        outputs, report, head_sha = self._pr_scan(
+            "fork-patch", self._fork("fork-b"), "patch-1", {"auth.py": _POLICY_AUTH_GUTTED}, "Tidy auth module",
+        )
+        self.assertNotIn("error", report)
+        self.assertEqual(report["temporal"]["branch_commit_hash"], head_sha[:7])
+        self.assertEqual(outputs["exit_code"], "2")
+        self.assertEqual(outputs["verdict"], "DESTRUCTIVE")
+
+    def test_head_ref_fallback_without_pull_request_payload(self):
+        outputs, report, head_sha = self._pr_scan(
+            "no-payload", self.seed, "feature/fallback", {"auth.py": _POLICY_AUTH_GUTTED}, "Tidy auth module",
+            event_head_sha=False,
+        )
+        self.assertEqual(report["temporal"]["branch_commit_hash"], head_sha[:7])
+        self.assertEqual(outputs["exit_code"], "2")
+
+    # AUDIT_LOG §V5: the `verdict` output must carry REVIEW and CAUTION, not only
+    # SAFE/DESTRUCTIVE derived from the exit code.
+
+    def test_verdict_output_reports_review(self):
+        outputs, report, _ = self._pr_scan(
+            "verdict-review", self.seed, "feature/no-description", _POLICY_README_EDIT, "",
+        )
+        self.assertEqual(report["verdict"]["status"], "REVIEW")
+        self.assertEqual(outputs["exit_code"], "0")
+        self.assertEqual(outputs["verdict"], "REVIEW")
+
+    def test_verdict_output_reports_caution(self):
+        outputs, report, _ = self._pr_scan(
+            "verdict-caution", self.seed, "feature/new-dependency",
+            {"requirements.txt": "requests\nevilpkg\n"}, "Add HTTP helper dependency",
+        )
+        self.assertEqual(report["verdict"]["status"], "CAUTION")
+        self.assertEqual(outputs["exit_code"], "0")
+        self.assertEqual(outputs["verdict"], "CAUTION")
+
+    # AUDIT_LOG §V6: the action exposes the consequence mode as an input.
+
+    def test_consequence_mode_input_reaches_the_analyser(self):
+        outputs, report, _ = self._pr_scan(
+            "mode-input", self.seed, "feature/advisory",
+            {"auth.py": _POLICY_AUTH_GUTTED}, "Tidy auth module", consequence_mode="advisory",
+        )
+        self.assertEqual(report["consequence_analysis"]["mode"], "advisory")
+        self.assertEqual(outputs["exit_code"], "0")
+        self.assertEqual(outputs["verdict"], "REVIEW")
+
+    def test_invalid_consequence_mode_input_is_an_error_not_destructive(self):
+        outputs, _report, _ = self._pr_scan(
+            "mode-invalid", self.seed, "feature/bad-mode", _POLICY_README_EDIT,
+            "Document login helper usage", consequence_mode="enforced",
+        )
+        self.assertEqual(outputs["exit_code"], "1")
+        self.assertEqual(outputs["verdict"], "ERROR")
+
+    def test_legitimate_fork_pr_passes_through_action(self):
+        outputs, report, head_sha = self._pr_scan(
+            "fork-benign", self._fork("fork-c"), "patch-2", _POLICY_README_EDIT, "Document login helper usage",
+        )
+        self.assertEqual(report["temporal"]["branch_commit_hash"], head_sha[:7])
+        self.assertEqual(outputs["exit_code"], "0")
+        self.assertEqual(outputs["verdict"], "SAFE")
+
+
+# ==============================================================================
+# DISTRIBUTION PACKAGING (AUDIT_LOG §V3)
+# ==============================================================================
+# publish.yml builds with `python -m build`. pyproject.toml must name modules that
+# exist and must ship every first-party module the console-script entry point imports.
+
+def _pyproject():
+    try:
+        import tomllib
+    except ImportError:  # Python < 3.11
+        raise unittest.SkipTest("tomllib requires Python 3.11+")
+    with open(os.path.join(_REPO_ROOT, "pyproject.toml"), "rb") as fh:
+        return tomllib.load(fh)
+
+
+def _first_party_imports(module):
+    """Top-level names imported anywhere in `module` that are root modules or packages of this repository."""
+    import ast
+
+    with open(os.path.join(_REPO_ROOT, module + ".py"), encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module.split(".")[0])
+    return {
+        n for n in names
+        if os.path.isfile(os.path.join(_REPO_ROOT, n + ".py"))
+        or os.path.isfile(os.path.join(_REPO_ROOT, n, "__init__.py"))
+    }
+
+
+def _import_closure(module):
+    """`module` plus every root module it imports, transitively."""
+    seen, todo = set(), [module]
+    while todo:
+        current = todo.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        if os.path.isfile(os.path.join(_REPO_ROOT, current + ".py")):
+            todo.extend(_first_party_imports(current))
+    return seen
+
+
+class TestDistributionPackaging(unittest.TestCase):
+
+    def test_declared_modules_and_packages_exist(self):
+        cfg = _pyproject()["tool"]["setuptools"]
+        for module in cfg.get("py-modules", []):
+            self.assertTrue(
+                os.path.isfile(os.path.join(_REPO_ROOT, module + ".py")),
+                f"py-modules entry '{module}' has no {module}.py",
+            )
+        for package in cfg.get("packages", []):
+            self.assertTrue(
+                os.path.isfile(os.path.join(_REPO_ROOT, *package.split("."), "__init__.py")),
+                f"packages entry '{package}' is not a package directory",
+            )
+
+    def test_shipped_modules_include_their_first_party_imports(self):
+        data = _pyproject()
+        cfg = data["tool"]["setuptools"]
+        shipped = set(cfg.get("py-modules", [])) | {p.split(".")[0] for p in cfg.get("packages", [])}
+        for target in data["project"]["scripts"].values():
+            self.assertIn(target.split(":")[0], shipped)
+        missing = {
+            module: sorted(_first_party_imports(module) - shipped)
+            for module in sorted(shipped)
+            if os.path.isfile(os.path.join(_REPO_ROOT, module + ".py"))
+            and _first_party_imports(module) - shipped
+        }
+        self.assertEqual(missing, {}, "first-party imports not shipped in the distribution")
+
+    def test_built_distribution_runs_a_scan(self):
+        """Build as publish.yml does (sdist, then a wheel from the sdist), install the
+        wheel's files into an empty directory and run the console-script target there."""
+        import importlib.metadata
+        import importlib.util
+        import tarfile
+        import zipfile
+
+        if importlib.util.find_spec("setuptools") is None:
+            self.skipTest("setuptools is required to build the distribution")
+        try:
+            st_version = tuple(int(p) for p in importlib.metadata.version("setuptools").split(".")[:2])
+        except ValueError:
+            st_version = (0, 0)
+        if st_version < (68, 0):
+            self.skipTest("pyproject.toml requires setuptools>=68")
+        if st_version < (70, 1) and importlib.util.find_spec("wheel") is None:
+            self.skipTest("setuptools<70.1 needs the wheel package to build wheels")
+
+        tmp = tempfile.mkdtemp(prefix="pg_dist_")
+        self.addCleanup(_force_rmtree, tmp)
+        env = _fixture_env()
+        env.pop("PYTHONPATH", None)
+
+        def backend(cwd, hook, out_dir):
+            proc = subprocess.run(
+                [sys.executable, "-c",
+                 "import sys, setuptools.build_meta as b; print(getattr(b, sys.argv[1])(sys.argv[2]))",
+                 hook, out_dir],
+                cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            self.assertEqual(proc.returncode, 0, f"{hook} failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}")
+            return proc.stdout.strip().splitlines()[-1]
+
+        src = os.path.join(tmp, "src")
+        shutil.copytree(_REPO_ROOT, src, ignore=shutil.ignore_patterns(
+            ".git", "build", "dist", "*.egg-info", "__pycache__", ".pytest_cache"))
+        dist = os.path.join(tmp, "dist")
+        os.makedirs(dist)
+
+        sdist_name = backend(src, "build_sdist", dist)
+        unpacked = os.path.join(tmp, "sdist")
+        with tarfile.open(os.path.join(dist, sdist_name)) as tf:
+            extract_kwargs = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+            tf.extractall(unpacked, **extract_kwargs)
+        (sdist_root,) = os.listdir(unpacked)
+        wheel_name = backend(os.path.join(unpacked, sdist_root), "build_wheel", dist)
+
+        site = os.path.join(tmp, "site")
+        with zipfile.ZipFile(os.path.join(dist, wheel_name)) as zf:
+            names = set(zf.namelist())
+            entry_points = "".join(
+                zf.read(n).decode("utf-8") for n in names if n.endswith(".dist-info/entry_points.txt")
+            )
+            zf.extractall(site)
+        entry_module = "analyze"
+        self.assertIn(f"payloadguard = {entry_module}:main", entry_points)
+        for module in sorted(_import_closure(entry_module)):
+            self.assertIn(f"{module}.py", names)
+
+        repo = os.path.join(tmp, "repo")
+        os.makedirs(repo)
+        _run_git(repo, "init", "-q")
+        _commit_files(repo, _policy_base_files(), "base")
+        _run_git(repo, "checkout", "-q", "-b", "feature")
+        _commit_files(repo, {"auth.py": _POLICY_AUTH_GUTTED}, "Tidy auth module")
+
+        # cwd=site puts the installed copy first on sys.path; this checkout is not on it.
+        proc = subprocess.run(
+            [sys.executable, "-c",
+             "import sys, analyze, consequence_engine, structural_parser\n"
+             "for m in (analyze, consequence_engine, structural_parser): print('MODULE', m.__file__)\n"
+             "sys.argv = ['payloadguard'] + sys.argv[1:]\n"
+             "analyze.main()\n",
+             repo, "feature", "main", "--pr-description", "Tidy auth module"],
+            cwd=site, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        loaded = [line.split(" ", 1)[1] for line in proc.stdout.splitlines() if line.startswith("MODULE ")]
+        self.assertEqual(len(loaded), 3, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for path in loaded:
+            self.assertTrue(
+                os.path.normcase(os.path.realpath(path)).startswith(os.path.normcase(os.path.realpath(site))),
+                f"{path} was not loaded from the installed distribution",
+            )
+        self.assertEqual(proc.returncode, 2, proc.stdout[-3000:] + proc.stderr[-3000:])
 
 
 if __name__ == "__main__":

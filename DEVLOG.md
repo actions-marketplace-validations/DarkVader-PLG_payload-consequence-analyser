@@ -2,6 +2,191 @@
 
 Reverse-chronological. Most recent entry first.
 
+## 2026-10-26 — Harness scan history; live regression blocked; fixture aging (AUDIT_LOG §H1–§H3)
+
+**Scan history:** workflow artifacts expire after 90 days, so the April–May `results.db` cannot be rebuilt. Harness `tools/collect_history.py` (branch `data/scan-history`) records the `PayloadGuard` check run of every scan on the fixture PRs' head commits in `regression-reports/scan_history.jsonl`, with the analyser commit and version resolved from the workflow pin at each report's target commit. 423 scans, 2026-04-24 to 2026-05-31, 17 sweeps; the last sweep (`fe68338`) matches 34/34 exit codes and 33/34 verdicts against the current manifest.
+
+**Live regression:** harness PR #78 (pin to v1.6.0) merged as `defb060`. Regression run #27 failed on its first API call: `REGRESSION_PAT` returns 401 (§H3). No PR was reopened. The sweep was then run from the browser (34 fixture PRs reopened, scanned and closed, none merged): 34/34 exit codes, 27/34 verdicts; the seven mismatches are SAFE-expected cases at REVIEW through branch age.
+
+**Preflight** (v1.6.0 against harness `main` `defb060`, live PR bodies): 38/38 exit codes match. Branch age is measured against the target commit, so the PR #78 merge aged every fixture to 152–185 days; 14 verdicts are raised by age alone. §H1: the six CAUTION-expected stable cases reach DESTRUCTIVE for age once `main` has a commit dated from 2026-11-22. §H2: RTA01 expects REVIEW from the content-scan signal that v1.2.0 removed for workflow files.
+
+**Tests:** `test_analyzer.py` 311 passed (no analyser code changed).
+
+## 2026-10-26 — Documentation brought up to date with v1.6.0
+
+Current-state statements corrected against the code (history entries left as written):
+
+- **README:** test counts; SCG stage and transition list; consequence-mode behaviour (`advisory` ignores WARN, never exits 2); policy column note (D-detector findings act only in `advisory`/`enforce`); L5b escalation instead of "BLOCK"; corrupted arrow; `allowlist.yml` format — the documented flat `packages:` list matched no ecosystem key (`python`, `npm`, `go`, `rust`), so following it would flag every added package; scanned manifests (`pyproject.toml`, `Cargo.toml`, not `Gemfile`).
+- **SYSTEM_BLUEPRINT:** D01–D10, configuration loading from the target branch and mode precedence, Action head-SHA entry point, CLI flags, package metadata (was 1.0.2), SCA +3 once (not per package), temporal age from the target commit date and `ValueError` on non-finite input, runtime events path (`PG_RUNTIME_EVENTS_PATH`), actual report keys, verification summary.
+- **WHITEPAPER:** consequence-engine section (detector IDs `D01_RENAME_MOVE`, `D02_HOLLOW_BODY`, `D05_SECURITY_TOUCH` and submodules `consequence_engine/matcher.py`, `detectors.py` did not exist), maximum score 36 (was 31), SCA scoring and allowlist keys, L2b/L2c double-scan claim (workflows are excluded from the content scanner), configuration reference (mode `off` and `compound_min_*` keys do not exist), data flow, three verification methods, Layer 2d section and Abstract heading added, live-harness status note and pin (`fe68338`, not `32014117…`), section numbering.
+- **llms.txt:** structural CRITICAL weight (+5, was listed as +3), MAX_SCORE 36, SCA, L2d, consequence engine and modes, proof counts.
+- **VERIFICATION / VERIFICATION_SPEC / HARNESS_BLUEPRINT / CLAUDE.md:** last-run status, scope note for the consequence engine, spec pin still valid (`_assess_consequence()` unchanged since `257d1f3`), offline harness tools, scoring and config sections, environment.
+- **TEST_REPORT.md** regenerated from a live run: 391 passed, 0 skipped, 0 failed (Python 3.14.3, Windows 11).
+
+## 2026-10-26 — v1.6.0 released; Z3 P9 made meaningful (AUDIT_LOG §V8)
+
+**Release:** tag `v1.6.0` on `6c3df91` (PR #110 merge commit, tree identical to the verified tree; #110 checks passed). "Publish to PyPI" run 40350394223 succeeded; `payloadguard-plg==1.6.0` installed from PyPI into a fresh virtualenv returns exit 2 on a destructive PR and 0 on a benign one. PR #108 was closed without merging; the six merged branches were deleted.
+
+**§V8:** Z3 P9 asserted its bound as a constraint and checked the negation, so it passed for any bound (verified with 0 and −100). P9 now models the score as the sum of `_assess_consequence()`'s per-signal contributions and proves it cannot exceed MAX_SCORE (36). Companion tests: 36 is reachable; without the content-flag cap the bound fails; the production scorer with every signal at maximum returns 36. A bound of 35 now yields a counterexample.
+
+**Tests:** 391 passed with Z3/CrossHair (`tests/proofs/` 19); 374 passed, 17 skipped without them.
+
+## 2026-10-26 — v1.6.0 release preparation
+
+Version 1.6.0 (`analyze.py`, `pyproject.toml`) packages the v1.5.0 audit fixes (§V1–§V7, §V10, §V11) and the re-run proofs. PyPI's latest release was 1.3.0: the v1.4.0 and v1.5.0 tag builds failed on the `packages = ["consequence_engine"]` error (§V3), so 1.6.0 is the first PyPI release since 1.3.0. Semantic versioning: the `consequence-mode` input and the new D01 and `.mjs`/`.cjs`/`.mts`/`.cts` coverage are backward-compatible features, hence a minor bump.
+
+`requires-python` changed from `>=3.8` to `>=3.11`. Python 3.8 cannot import `structural_parser.py` (its module-level `dict[str, str]` annotation is evaluated at import); 3.9 and 3.10 are untested; 3.11 (CI and the Action) and 3.14 (local) are verified. Classifiers list 3.11–3.14.
+
+Release verification found §V11: installed from the built wheel, the `payloadguard` console script exited 1 with `UnicodeEncodeError` when stdout was redirected on Windows (cp1252), before writing any report; the Action and all CLI tests set `PYTHONUTF8=1`, which masked it. Fixed in `50d6723` with a regression test that forces `PYTHONIOENCODING=cp1252`.
+
+Release procedure: tag `v1.6.0` on the merged release commit after confirming its tree equals the verified branch tree and the pull request checks passed; the tag push runs `publish.yml` (`python -m build`, `twine upload`).
+
+## 2026-10-26 — Version history to v1.5.0; proof runs; temporal drift hardening (AUDIT_LOG §V8–§V10)
+
+**Version history:** CLAUDE.md, SYSTEM_BLUEPRINT.md, WHITEPAPER.md, llms.txt, PROOFS.md and VERIFICATION.md updated to v1.5.0 (tag `v1.5.0` → `93f94f9`), with an "Unreleased" entry for the §V1–§V7 fixes now on `main`. Corrected stale facts: the v1.4.0 entry's package layout and detector IDs, the score range (36, not 31), the Z3 property table, and proof-suite counts.
+
+**Proof runs:**
+- Z3 P1–P10: 10 passed. CrossHair contract wrappers: 5 passed (z3-solver 5.3.2.0, crosshair-tool 0.0.112; local, Windows 11, Python 3.14.3).
+- CrossHair CLI, `--per_condition_timeout 30`: no counterexamples in `consequence_pure`, `structural_pure` or `semantic_pure` (`semantic_pure` confirmed over all paths); counterexample in `temporal_pure` (§V10).
+- Dafny run #16 (GitHub Actions `workflow_dispatch`, `main` `9e83cce`, Dafny 4.9.1 + Z3 4.12.1): 7 + 1 + 1 verified, 0 errors. The committed log had predated the 2026-06-11 change to `assess_consequence.dfy` (§V9).
+
+**§V10:** CrossHair found `analyze_drift_pure(0, inf, …)` returning a NaN drift score classified CURRENT. `TemporalDriftAnalyzer.analyze_drift()` now raises `ValueError` for non-finite age or velocity, and `temporal_pure.py` adds `pre: math.isfinite(target_velocity)`. Four regression tests fail before and pass after; the CrossHair retest exits 0.
+
+**§V8 (open):** Z3 P9 constrains the score to the bound it then checks, so it is vacuous as encoded.
+
+**Tests:** 387 passed with Z3/CrossHair installed.
+
+## 2026-10-26 — Action verdict output, consequence-mode input, JS/TS module extensions (AUDIT_LOG §V5–§V7)
+
+**§V5:** the action's `verdict` output mapped exit 0 to `SAFE`, so `REVIEW` and `CAUTION` were never emitted. The scan step now reads the verdict from the JSON report and falls back to the exit-code mapping when the report cannot be read.
+
+**§V6:** `action.yml` had no consequence-mode input and the README enforce example did not enable enforce mode. The new `consequence-mode` input is validated in the step (invalid values exit 1; an argparse usage error would exit 2 and read as DESTRUCTIVE) and passed as `--consequence-mode`. `PAYLOADGUARD_CONSEQUENCE_MODE` is applied in `main()` below the CLI flag.
+
+**§V7:** `.mjs`/`.cjs` map to `javascript` and `.mts`/`.cts` to `typescript`. Legacy L4 now analyses them as it does `.js`/`.ts`; parity tests pin SymbolFacts, legacy node names and findings to the base extension.
+
+**Tests:** 14 new tests (5 of 6 §V5/§V6 tests and all 8 §V7 tests fail on the previous code). Suite: 368 passed, 15 skipped. Harness oracle 41/41; mutation suite 16/16; Action simulation unchanged. All 2026-10-26 findings are fixed.
+
+## 2026-10-26 — D01 reports source in unparsed languages (AUDIT_LOG §V4)
+
+**Defect:** `ConsequenceEngine.analyze_deltas()` only parsed paths with a registered structural parser, so D01 could not emit `UNSUPPORTED_EXTENSION`. A PR gutting a `verify` function in Ruby, C# or a `.mjs` module produced no findings, `parser_completeness.complete: true` and syntax capability `available`, with zero files parsed.
+
+**Repair:** source files in languages without a parser (`_UNPARSED_SOURCE_EXTS` in `consequence_engine.py`) now reach `extract_symbols()`, which returns `UNSUPPORTED_EXTENSION`; D01 reports them as LOW / WARN with a manual-review remediation, and the syntax capability is `unavailable` when no changed file had a parser. Data, configuration and markup formats are excluded; SQL migrations remain with D10. WARN findings do not change verdicts or exit codes.
+
+**Tests:** X06 cases in `TestParserCompletenessD01` (Ruby, C#, `.mjs`; added and deleted files; non-code control; mixed PR with unchanged non-D01 findings) and an `analyze()` integration test. 6 fail on `main` (`e77edf3`); 7 pass after. Suite: 354 passed, 15 skipped. Harness oracle 41/41; mutation suite 16/16.
+
+**New finding:** §V7 — `.mjs`/`.cjs`/`.mts`/`.cts` are not mapped to the installed JS/TS grammars.
+
+## 2026-10-26 — Distribution builds again (AUDIT_LOG §V3)
+
+**Defect:** `pyproject.toml` listed `consequence_engine` under `packages`, but it is the single-file module `consequence_engine.py`. setuptools stopped with "package directory 'consequence_engine' does not exist", so `pip install .` and the `python -m build` step in `publish.yml` failed for v1.4.0 and v1.5.0.
+
+**Repair:** `consequence_engine` moved to `py-modules`. Deleting the `packages` line alone would build a wheel without `consequence_engine.py`, which `analyze.py` imports at load time.
+
+**Tests:** `TestDistributionPackaging` checks the declared modules, checks that every first-party import of the shipped modules is shipped, and builds sdist → wheel as `publish.yml` does before running a scan through the installed entry point. 2 fail on `main` (`a388f05`); 3 pass after. A fresh-venv `pip install` and the `payloadguard` console script were verified separately (exit 2 destructive, exit 0 benign). Suite: 347 passed, 15 skipped. Harness oracle 41/41; mutation suite 16/16.
+
+## 2026-10-26 — Action scans the PR head commit (AUDIT_LOG §V2)
+
+**Defect:** `action.yml` passed `github.head_ref` to `analyze.py`. Fork PR head branches do not exist in the base repository: a fork branch `patch-1` exited 1, and a fork branch named `main` resolved to the base repository's `main`, so base was diffed against itself and a PR gutting `Auth.verify` scanned SAFE with exit 0.
+
+**Repair:** the scan step passes `github.event.pull_request.head.sha` (present locally as a parent of the `pull_request` merge commit under `fetch-depth: 0`), with `github.head_ref` as the fallback for events without a `pull_request` payload. The repository's own `payloadguard.yml` workflow is changed the same way. `analysis.branch` in reports now carries the scanned commit SHA.
+
+**Tests:** the §V2 expected failure is replaced by three fork regression tests and a fallback test in `TestActionPolicyTrustBoundary`. Against the previous `action.yml`: 3 failed, 3 passed; after: all pass. Suite: 344 passed, 15 skipped. Harness oracle 41/41; mutation suite 16/16.
+
+## 2026-10-26 — Policy files read from the target branch (AUDIT_LOG §V1)
+
+Audit of v1.5.0 (`93f94f9`) across the SCG/D01–D10 work and the Action-to-verdict path. The Action path was exercised by running the `action.yml` scan steps in bash against a local reproduction of a `pull_request` merge checkout.
+
+**Defect:** `payloadguard.yml` and `allowlist.yml` were read from the working tree, which in CI is the PR merge result. A PR could set `consequence.mode: shadow`, raise thresholds or allowlist its own dependency, and pass its own scan (enforce-mode exit 2 became exit 0).
+
+**Repair:** `load_config()` and `_load_allowlist()` take an optional `ref` and read the file from that commit (`_read_file_at_ref()`, with the `origin/<ref>` fallback used by `_resolve_ref()`). `main()` passes the target branch; `analyze()` passes the resolved target. Calls without `ref` keep the working-tree behaviour.
+
+**Tests:** `TestPolicyReadFromTargetBranch` (CLI end to end on a git fixture) and `TestActionPolicyTrustBoundary` (`action.yml` steps in bash). 7 fail on `93f94f9`; 10 pass after. Suite: 340 passed, 15 skipped, 1 xfailed. Harness oracle 41/41; mutation suite 16/16.
+
+**Open:** §V2–§V6 in `AUDIT_LOG.md`.
+
+## 2026-10-25 — v1.5.0: Workflow Integrity (D08), Test Erosion (D09), Migration Loss (D10) & Build Wrapper Security
+
+### What was built
+
+Shipped PayloadGuard v1.5.0, expanding the Semantic Consequence Graph (`consequence.v1`) with three new deterministic detectors (`D08`, `D09`, `D10`), extending `D05` with build wrapper tampering detection, and hardening multi-language AST/tokenizer parsing across GitHub Actions workflows, test frameworks, and database persistence layers.
+
+### Detectors & Capabilities Shipped in v1.5.0
+
+**1. `D08_WORKFLOW_INTEGRITY` (CI/CD Supply Chain & Pipeline Security):**
+- **Expression Injection (W02 / CWE-78):** Flags untrusted GitHub event expressions (`${{ github.event.pull_request.title }}`, `${{ github.head_ref }}`, etc.) interpolated directly inside `run:` shell blocks (`UNTRUSTED_WORKFLOW_EXPRESSION_INJECTION`, `BLOCK`). Recommends intermediate `env:` variable binding.
+- **Pwn Request Checkout (W01):** Detects `pull_request_target` workflows checking out untrusted pull request head code (`PULL_REQUEST_TARGET_UNTRUSTED_CHECKOUT`, `BLOCK` with write permissions or secrets access, `REVIEW` otherwise).
+- **Action SHA Pin Downgrade:** Flags GitHub Actions downgraded from immutable 40-character commit SHAs to mutable tags or branch names (`ACTION_PIN_DOWNGRADE`, `REVIEW`).
+- **CI Gate Weakening:** Detects newly added `continue-on-error: true` flags or `permissions: write-all` on modified workflows (`CI_GATE_WEAKENED`, `REVIEW`).
+- **Privileged `workflow_run` Artifact Poisoning:** Detects privileged `workflow_run` triggers downloading untrusted PR artifacts without intermediate sandboxing (`WORKFLOW_RUN_UNTRUSTED_ARTIFACT`, `REVIEW`).
+- **Unpinned Third-Party Actions:** Flags newly introduced third-party actions using mutable tags rather than immutable SHAs (`ACTION_PIN_UNPINNED`, `WARN`). Official first-party `actions/*` and `github/*` namespaces are excluded to eliminate alert fatigue.
+
+**2. `D09_TEST_EROSION` (Test Suite Preservation & Contract Enforcement):**
+- **Tautological Assertion Replacement:** Detects test functions where substantive assertions were hollowed out or replaced with tautologies (`assert True`, `assert 1 == 1`, `expect(true).toBe(true)`), preventing attackers from silently gutting regression tests while keeping CI green (`TEST_ASSERTION_EROSION`, `BLOCK`).
+- **Newly Introduced Test Skips:** Detects newly added test-skipping decorators (`@pytest.mark.skip`, `@pytest.mark.xfail`, `it.skip`, `@Disabled`, `@Ignore`) and runtime skip invocations (`pytest.skip()`, `t.Skip()`), preventing bypass of failing tests (`TEST_SKIPPED_NEWLY`, `REVIEW`).
+
+**3. `D10_MIGRATION_PERSISTENCE_LOSS` (Database & Schema Integrity):**
+- **Catastrophic Wipe-Outs:** Flags `TRUNCATE TABLE` and `DROP DATABASE` / `DROP SCHEMA` statements in automated migrations (`CATASTROPHIC_DATA_WIPEOUT`, `BLOCK`).
+- **Multi-Line SQL AST & Tokenizer:** Parses multi-line SQL statements across inline comments (`/* ... */`, `--`), line breaks, and bracketed/backtick-quoted identifiers (`ALTER TABLE ... DROP [COLUMN]`).
+- **Forward-vs-Rollback Boundary Isolation:** Accurately isolates forward migration operations from rollback code across Alembic (`upgrade()` vs `downgrade()`), Knex/TypeORM/Sequelize (`up()` vs `down()`), Rails ActiveRecord (`change` vs `up`/`down`), and Goose/sql-migrate (`-- +goose Up` vs `-- +goose Down`, paired `*.up.sql`/`*.down.sql`). Legitimate rollback drops emit zero false positives.
+- **Framework-Aware Irreversibility Detection:** Flags Rails `change` migrations using `drop_table` without schema definition blocks, Django migrations using `RunSQL` without `reverse_sql`, and empty/missing `downgrade()` / `down()` functions as `IRREVERSIBLE_PERSISTENCE_DROP` (`BLOCK`). Reversible drops are flagged for review (`DESTRUCTIVE_PERSISTENCE_MIGRATION`, `REVIEW`).
+- **Directory Scoping:** Strictly scopes analysis to migration directories, excluding test fixtures, seeds, docs, and samples.
+
+**4. `D05` Build Wrapper Tampering:**
+- Flags remote script execution and reverse shell patterns (`curl | sh`, `wget | bash`) inside build wrappers (`mvnw`, `gradlew`, `Makefile`, `build.sh`) as `BUILD_WRAPPER_TAMPERING` (`BLOCK`).
+
+**5. Structural Parser Hardening:**
+- Updated `_collect_python_const_bools` in `structural_parser.py` to traverse nested function definitions, correctly identifying variables mutated via `nonlocal` or nested assignment and eliminating false-positive short-circuit detections on inner helper functions.
+
+### Test & Harness Verification Results
+
+- **Pytest Suite:** 330 passed, 0 failed in 2.39s (`test_analyzer.py` + `test_consequence_engine.py`).
+- **Harness Mutation Suite:** 16/16 passed (0 False Positives, 0 False Negatives).
+- **Harness Manifest Oracle (`validate_manifest.py --verify-consequence`):** 41/41 test case entries verified across SQLite schemas v1+v2 and Consequence Engine v1 oracle assertions.
+
+---
+
+## 2026-10-23 — SCG Consequence Engine (`consequence.v1`) & `D01`–`D06` v2 shipped + validated
+
+### What was built
+
+Implemented and validated the Semantic Consequence Graph (`consequence.v1`) differential analysis engine across Python and Tree-sitter languages (JS/TS/Go/Rust/Java), upgrading PayloadGuard from pure additive line/node counting to evidence-driven symbol consequence analysis. Merged via PR #95 (`5965664`) and PR #97 (`cb74a6e`) in `payload-consequence-analyser`, and PR #74 (`4e8e1df`) and PR #75 (`dcc5522`) in `payloadguard-test-harness`.
+
+### Files changed
+
+**`structural_parser.py`:**
+- Added `SymbolFact` dataclass and `extract_symbol_facts(content, filepath)` across Python (`ast`) and JS/TS/Go/Rust/Java (`tree-sitter`).
+- Extracted `qualified_name`, `signature_shape`, `body_norm_hash`, `body_tokens`, `calls`, `imports` (including `alias:module.target` tracking), `guard_conditions` (`if`/`assert`/guard predicates), `has_auth_signal`, `is_exported`, and `is_hollow_body`.
+
+**`consequence_engine/` (`models.py`, `matcher.py`, `detectors.py`, `engine.py`, `sarif.py`):**
+- 5-stage symbol matching algorithm (`match_symbols`) pairing base and head `SymbolFact` sets via exact qualified match, exact `body_norm_hash` rename/move match, and weighted signature/body/call Jaccard similarity (`RENAMED`, `MOVED`, `MODIFIED`, `DELETED`, `ADDED`).
+- Detectors `D01`–`D06` v2:
+  - `D01_RENAME_MOVE`: Reconciles renamed and moved symbols (`is_benign_refactor=True`), suppressing false positives on class renames (`T12`) and cross-file moves.
+  - `D02_HOLLOW_BODY`: Detects implementations gutted to pass/stub/constant returns while preserving signatures.
+  - `D03_COMPOUND_LOSS`: Resolves `A03` (`adversarial/slow-deletion`) and `A06` (`adversarial/threshold-gaming`) after filtering out `D01` renames/moves.
+  - `D04_PUBLIC_API_BREAK` v2: Detects removed or signature-broken exported symbols with static caller resolution across standard and aliased imports.
+  - `D05_SECURITY_TOUCH`: Flags deleted or hollowed security/auth/validation symbols (`CRITICAL`).
+  - `D06_GUARD_REGRESSION` v2: Detects removed `if`/`assert` guard predicates inside modified functions even when the function body remains non-hollow.
+- `sarif.py`: SARIF 2.1.0 generator (`generate_sarif_report`) with `reportingDescriptor` rules for `D01`–`D06`, physical locations, and remediation guidance.
+
+**`analyze.py`:**
+- Integrated `ConsequenceEngine` into `PayloadAnalyzer.analyze()` with `consequence.mode` (`shadow | enforce | off`), CLI `--consequence-mode`, and `--save-sarif`.
+- Upgraded `print_report()` and `generate_markdown_summary()` with structured consequence tables and collapsible `<details><summary>Evidence & Remediation</summary>` blocks.
+
+**`test_consequence_engine.py`:**
+- Added 31 unit and integration tests covering `SymbolFact` v1, 5-stage matching, `D01`–`D06` v2, CLI/Markdown/SARIF usability surfaces, and live harness branch validation (`A03`, `A06`, `T12`, `T01`).
+
+### Test & harness verification results
+
+```
+python -m pytest test_consequence_engine.py test_analyzer.py -q
+315 passed, 0 failed
+```
+
+- **Permanent harness verification (`tools/validate_manifest.py --verify-consequence`):** 38/38 active permanent branches pass all `expected_consequence` oracle assertions in both `shadow` and `enforce` modes.
+- **Synthesized payload verification:** 8/8 adversarial and benign refactoring payload branches passed (`synth/guard-regression-auth`, `synth/aliased-api-break`, `synth/cross-file-refactor`, `synth/hollow-auth-bypass`, `synth/distributed-slow-delete`, `synth/compound-subthreshold`, `synth/benign-guard-refactor`, `synth/benign-class-rename`) with 100% precision and 0% false positives.
+
+---
+
 ## 2026-06-11 — Sprint 1 complete: L2d AI tooling config poisoning detection shipped
 
 ### What was built
