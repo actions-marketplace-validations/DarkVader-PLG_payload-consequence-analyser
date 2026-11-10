@@ -138,12 +138,12 @@ git.Repo(workspace)
   │       added_file_flags = _scan_added_file_content(diffs)
   │
   ├─[L2b] SCA — Dependency Scanning (opt-in)
-  │        manifest_diffs = added/modified requirements*.txt|package.json|go.mod|Cargo.toml|Gemfile
+  │        manifest_diffs = added/modified/renamed requirements*.txt|pyproject.toml|package.json|go.mod|Cargo.toml
   │        unverified     = packages not in allowlist.yml
-  │        score          = +3 per unique unverified package
+  │        score          = +3 once when any package is unverified
   │
   ├─[L2c] Actions Poisoning Detection
-  │        workflow_diffs = added/modified .github/workflows/**/*.yml
+  │        workflow_diffs = added/modified/renamed/copied .github/workflows/**/*.yml
   │        signals        = base64_payload | credential_harvest | prt_with_write |
   │                         dormant_trigger | forged_bot_author | oidc_elevation |
   │                         dangerous_prt
@@ -160,7 +160,7 @@ git.Repo(workspace)
   │
   ├─[L5b] Semantic Transparency
   │        Phase 1: _extract_claim(pr_description) → scope, dominant_op, raw_tokens
-  │        Phase 2: _profile_diff(diffs) → churn, insertion_ratio, ext_count,
+  │        Phase 2: _profile_diff(patch diffs) → churn, insertion_ratio, ext_count,
   │                                        structural_alterations, sensitive_paths
   │        Phase 3: cross-correlate → mci_score ∈ [0,1]
   │        mci_score ≥ 0.5 → DECEPTIVE_PAYLOAD (escalates verdict)
@@ -189,9 +189,9 @@ git.Repo(workspace)
 | `action.yml` | Composite GitHub Action definition |
 | `agent/` | eBPF runtime defence agent (Go + cilium/ebpf) |
 | `agent/bpf/probe.c` | 4 tracepoint probes + block mode BPF maps |
-| `test_analyzer.py` | 311-test unit, integration, policy, Action-path and packaging suite |
+| `test_analyzer.py` | 332-test unit, integration, policy, Action-path and packaging suite |
 | `test_consequence_engine.py` | 61-test SCG Consequence Engine unit & integration suite |
-| `tests/proofs/` | Z3 SMT proofs (P1–P10, 13 tests) + CrossHair pytest wrappers (5) + temporal contract regression (1) |
+| `tests/proofs/` | Z3 SMT proofs (P1–P11, 18 tests) + CrossHair pytest wrappers (5) + temporal contract regression (1) + L3 model parity (1) |
 | `verification/` | CrossHair pure extraction modules — consequence, structural, temporal, semantic — and Dafny specifications (`verification/dafny/`) |
 
 ---
@@ -257,9 +257,13 @@ authorization[^/]*\.(py|js|ts)
 
 **Algorithm:**
 ```python
-for diff in diffs where change_type in ('A', 'M'):
+for diff in diffs where change_type in ('A', 'M', 'R', 'C'):
     if path matches _MANIFEST_PATTERNS:
-        added_packages = _parse_added_packages(diff)
+        # package.json: JSON entries added or changed in dependencies, devDependencies,
+        # peerDependencies, optionalDependencies, overrides, resolutions (_npm_added_packages);
+        # other manifests, or package.json that does not parse: added diff lines.
+        # A manifest renamed from a path of another type is compared with an empty base.
+        added_packages = _npm_added_packages(base, head) or _parse_added_packages(diff)
         for pkg in added_packages:
             if pkg not in allowlist[ecosystem_key]:      # python | npm | go | rust
                 unverified_packages.add(pkg)
@@ -280,7 +284,7 @@ Any unverified package adds +3 points once, regardless of how many are listed, s
 
 **Purpose:** Detect CI pipeline poisoning in added or modified workflow files. This layer targets the specific techniques used to poison GitHub Actions pipelines — base64 payload delivery, credential exfiltration, privilege escalation — which are invisible to structural drift analysis (which operates on source code ASTs, not YAML) and to L2 forensic analysis (which operates on file deletions, not content of added files).
 
-**Scope:** All added (`A`) and modified (`M`) files matching `.github/workflows/**/*.yml`, `.github/workflows/**/*.yaml`, `.github/actions/**/*.yml`, `.github/actions/**/*.yaml`.
+**Scope:** All added (`A`), modified (`M`), renamed (`R`) and copied (`C`) files matching `.github/workflows/**/*.yml`, `.github/workflows/**/*.yaml`, `.github/actions/**/*.yml`, `.github/actions/**/*.yaml`.
 
 **Signal types:**
 
@@ -289,7 +293,7 @@ Any unverified package adds +3 points once, regardless of how many are listed, s
 | `base64_payload` | CRITICAL | +5 | Base64 string piped to a shell interpreter |
 | `credential_harvest` | CRITICAL | +5 | AWS/GCP metadata endpoint, secret grep, env dump to curl |
 | `pull_request_target_with_write_permissions` | CRITICAL | +5 | `pull_request_target` trigger + any write permission declared |
-| `dormant_trigger_with_payload` | HIGH | +3 | `workflow_dispatch` or `schedule` + shell execution in same file |
+| `dormant_trigger_with_payload` | HIGH | +3 | `workflow_dispatch` or `schedule` among the parsed `on:` triggers (any YAML layout) + shell execution in the same file |
 | `forged_bot_author` | HIGH | +3 | `git config user.name/email` set to a known bot identity |
 | `oidc_elevation_typosquatted` | CRITICAL | +5 | `id-token: write` + consumer action resembles a safe prefix but isn't (`aws-actions-unofficial/`, `google-github-actions-fork/`, etc.) |
 | `oidc_elevation_no_consumer` | HIGH | +3 | `id-token: write` with no legitimate OIDC consumer in the same file |
@@ -311,7 +315,7 @@ A single CRITICAL signal is sufficient to reach DESTRUCTIVE (score ≥ 5). A sin
 
 ### 4.2d Layer 2d — AI Tooling Configuration Poisoning
 
-**Purpose:** Detect added or modified configuration that makes developer tools or package managers execute commands when a repository is opened, installed or loaded by an AI coding assistant.
+**Purpose:** Detect added, modified, renamed or copied configuration that makes developer tools or package managers execute commands when a repository is opened, installed or loaded by an AI coding assistant.
 
 **Surfaces (`_AI_CONFIG_PATH_RE`):** `.claude/settings.json`, `.gemini/settings.json`, `.cursor/rules/*.mdc`, `.vscode/tasks.json`, `.cursor/mcp.json`, `.vscode/mcp.json`, `mcp.json`, `composer.json`, `Gemfile`, `binding.gyp`, `package.json`.
 
@@ -325,9 +329,9 @@ A single CRITICAL signal is sufficient to reach DESTRUCTIVE (score ≥ 5). A sin
 | `binding_gyp_command_substitution` | `_check_binding_gyp` | CRITICAL |
 | `cursor_nl_exec_imperative` | `_check_cursor_rule` | HIGH |
 | `mcp_local_server_command` | `_check_mcp_json` | HIGH |
-| `hidden_unicode` | all surfaces | HIGH |
+| `hidden_unicode` | all surfaces: U+200B–U+200D, U+202A–U+202E, U+2066–U+2069, U+FEFF (not as the first character), U+E0000–U+E007F | HIGH |
 
-**Scoring:** any CRITICAL signal adds +5 (DESTRUCTIVE floor, Dafny POST-12); otherwise any HIGH signal adds +3. These paths are excluded from the added-file content scanner, so a signal is not scored twice.
+**Scoring:** any CRITICAL signal adds +5 (DESTRUCTIVE floor, Dafny POST-12); otherwise any HIGH signal adds +3. These paths are excluded from the added-file content scanner, so a signal is not scored twice. JSON surfaces are read with `_json_object()`; valid JSON of an unexpected shape is skipped rather than aborting the analysis.
 
 **Outputs:** `ai_config_poisoning` dict with `flagged_configs` list and `total`.
 
@@ -437,12 +441,12 @@ Branch age is clamped to `max(0, days)` — a branch newer than the target commi
 
 Sanitises markdown (strips code fences, inline code, link syntax, formatting characters), tokenises to lowercase alphanumeric tokens, applies a Lovins-inspired suffix stemmer (longest-first, minimum 3-character candidate). Classifies two dimensions:
 
-- **Scope:** `micro` if any token matches `_SEMANTIC_MICRO_SCOPE` (minor, typo, cleanup, whitespace, cosmetic, etc.); `macro` if any matches `_SEMANTIC_MACRO_SCOPE` (overhaul, architectural, rewrite, comprehensive, etc.); `unspecified` otherwise.
+- **Scope:** `micro` if any token matches `_SEMANTIC_MICRO_SCOPE` (minor, typo, trivial, whitespace, cosmetic, etc.); otherwise `macro` if any matches `_SEMANTIC_MACRO_SCOPE` (overhaul, architectural, rewrite, comprehensive, etc.); otherwise `docs` if any matches `_SEMANTIC_DOCS_SCOPE` (docs, readme, changelog); `unspecified` otherwise. A `docs` claim is a micro claim about the files outside documentation (`_SEMANTIC_DOC_FILE_RE`: `.md`, `.mdx`, `.rst`, `.adoc`, images, README/CHANGELOG/LICENSE-style files), so Phase 3 measures only those files (`diff_reality.outside_documentation`). "grammar", "cleanup" and "complete" are not scope words: in real descriptions they named features (AUDIT_LOG SEM-02).
 - **Dominant operation:** checked in priority order — `remedial` (fix, patch, resolve, revert), `destructive` (remove, delete, drop, deprecate), `additive` (add, implement, create, build), `mutative` (update, refactor, migrate, replace).
 
 **Phase 2 — Diff Profiler** (`_profile_diff`):
 
-Walks GitPython diff objects. For each diff: extracts file extension; checks path against `_SEMANTIC_SENSITIVE_PATHS` (`.github/workflows/`, auth files, package manifests, Dockerfiles, schema/migration files, secrets); counts added and deleted lines from the unified diff bytes; detects structural additions (lines matching `+def `, `+class `, `+async def `, `+function `, `+interface `, `+struct `).
+Walks a GitPython patch diff (`create_patch=True`; the diff used by the other layers carries no patch text). For each diff: extracts file extension; checks path against `_SEMANTIC_SENSITIVE_PATHS` (`.github/workflows/`, auth files, package manifests, Dockerfiles, schema/migration files, secrets); counts added and deleted lines from the unified diff bytes; detects structural additions (lines matching `+def `, `+class `, `+async def `, `+function `, `+interface `, `+struct `).
 
 Computes: `total_churn = lines_added + lines_deleted`, `insertion_ratio = lines_added / total_churn`.
 
@@ -455,7 +459,7 @@ Five independent signals, each contributing to `mci_score`:
 | `scope_understated` | scope == micro AND total_churn > churn_limit (default 50) | +0.4 |
 | `operation_mutation` | scope == micro AND structural_alterations > 0 | +0.3 |
 | `hidden_component_modification` | scope == micro AND sensitive file in diff not named in description | +0.3 |
-| `phantom_additions` | dominant_op == remedial AND insertion_ratio > ir_threshold (default 0.9) | +0.4 |
+| `phantom_additions` | scope == micro AND dominant_op == remedial AND total_churn > churn_limit AND insertion_ratio > ir_threshold (default 0.9) | +0.4 |
 | `cross_stack_micro_claim` | scope == micro AND distinct_file_extensions >= 3 | +0.2 |
 | `macro_scope_manual_review` | scope == macro | advisory only — no MCI contribution |
 
@@ -465,12 +469,12 @@ Five independent signals, each contributing to `mci_score`:
 
 | mci_score | Status | Verdict effect |
 |---|---|---|
-| ≥ 0.5 | `DECEPTIVE_PAYLOAD` | Escalates verdict one step (SAFE→CAUTION, REVIEW→CAUTION, CAUTION→DESTRUCTIVE) |
+| ≥ 0.5 | `DECEPTIVE_PAYLOAD` | Escalates verdict one step (SAFE→CAUTION, REVIEW→CAUTION, CAUTION→DESTRUCTIVE when the content score alone reaches CAUTION, so branch age cannot decide DESTRUCTIVE) |
 | > 0.0 or macro advisory | `CAUTION_MISMATCH` | Escalates SAFE→REVIEW only |
 | 0.0 | `TRANSPARENT` | No change |
 | (no description) | `UNVERIFIED` | Escalates SAFE→REVIEW |
 
-Unlike L1–L4, L5b verdict escalation operates on the pre-existing verdict rather than contributing to the numerical `severity_score`. This allows it to upgrade a SAFE verdict on a low-volume deceptive PR without interfering with the scoring model's calibration.
+Unlike L1–L4, L5b adds no evidence points: it raises the verdict produced by L3. The raised verdict takes the severity and recommendation of its new status, and its score rises to the lowest score of that band (REVIEW 1, CAUTION 3, DESTRUCTIVE 5), so the final verdict stays in the L3 score bands; `escalation_score` records the points added (AUDIT_LOG §V12). This allows L5b to upgrade a SAFE verdict on a low-volume deceptive PR without changing the calibration of the content signals.
 
 **Output:** `semantic` dict with `status`, `is_deceptive`, `mci_score`, `signals` list, `semantic_claim` (scope, dominant_op, raw_tokens), `diff_reality` (churn, insertion_ratio, ext_count, structural_alterations, sensitive_paths), `matched_keyword` (first signal, for backwards compatibility), `directive` string.
 
@@ -521,15 +525,18 @@ Unlike L1–L4, L5b verdict escalation operates on the pre-existing verdict rath
    - Stage 4: Container rename by member overlap (cascading to members), function rename with identical body hash and signature, same-scope replacement by a no-op stub (`RENAMED` / `RENAMED_AND_GUTTED` / `AMBIGUOUS`)
    - Stage 5: Unmatched symbols classified as `REMOVED` or `ADDED`
 3. **Detectors `D01`–`D10`:**
-   - `D01_PARSER_INCOMPLETE`: syntax errors, missing grammars, and changed source in languages without a parser (`ANALYSIS_INCOMPLETE`; WARN, or REVIEW for a head-side parse error).
+   - `D01_PARSER_INCOMPLETE`: syntax errors, missing grammars, changed source in languages without a parser, source bytes invalid in the language's encoding, symlinks that do not resolve inside the repository (`ANALYSIS_INCOMPLETE`; one finding per file and status, WARN, or REVIEW when the head has a parse error or unresolved link); unparsable files in the caller index when `D04` reports an API change (`PG-D01-INDEX`, WARN).
+   - `D02_STRUCTURAL_DELTA`: a source file replaced by, or re-pointed as, a symlink (`SOURCE_REPLACED_BY_SYMLINK`, REVIEW); the symbol-level detectors analyse the link target's content.
    - `D02_BODY_WEAKENING` / `D02_AMBIGUOUS_REFACTOR`: surviving, renamed or moved symbols gutted to no-op stubs; ambiguous refactors reported as incomplete.
    - `D03_COMPOUND_LOSS`: distributed deletion (`A03`) and threshold-gaming dilution (`A06`) after renames and moves are reconciled.
-   - `D04_PUBLIC_API_BREAK`: removed or incompatible exported symbols with surviving callers, including import-alias resolution.
-   - `D05_BUILD_DEPENDENCY_DELTA`: build wrapper tampering, lifecycle scripts, manifest changes without lockfile updates.
-   - `D06_GUARD_REGRESSION`: removed decorators and rollback calls, guard polarity inversion, boolean short-circuits, state-guard removal, early-return bypass, swallowed exceptions.
+   - `D04_PUBLIC_API_BREAK`: removed or incompatible exported symbols with surviving callers, including import-alias resolution. The caller index covers at most `max_repo_files` head files, those naming a changed symbol first; `graph_summary.caller_index` reports its coverage, and a finding without a breaking caller states when the index was incomplete.
+   - `D05_BUILD_DEPENDENCY_DELTA`: build wrapper tampering (head lines compared with the base's active lines), npm scripts that run without being named, manifest changes without lockfile updates.
+   - `D06_GUARD_REGRESSION`: removed decorators and rollback calls, guard polarity inversion, boolean short-circuits, state-guard removal, early-return bypass, swallowed exceptions. For Python, execution facts (`call_exec`, `result_discarded`, `deny_cond`) also report a guard that no longer runs on every path (swallowed, conditional, deferred, unreachable), a side-effecting call moved ahead of its guard, a predicate whose result is ignored, and a denial condition that admits an input it denied before on the same terms. A guard call or clause moved into a helper that enforces it on every path is not reported as removed.
    - `D08_WORKFLOW_INTEGRITY`: `run:` expression injection, `pull_request_target` untrusted checkout, SHA pin downgrade, gate weakening, `workflow_run` artifact poisoning, unpinned third-party actions.
    - `D09_TEST_EROSION`: tautological assertion replacement and newly skipped tests.
    - `D10_MIGRATION_PERSISTENCE_LOSS`: `TRUNCATE` / `DROP DATABASE|SCHEMA`, irreversible and forward-only drops across SQL and migration frameworks.
+
+   `D05`, `D08` and `D10` compare a file renamed from a path they do not inspect against an empty base. Changed and indexed sources are decoded as their language reads them (Python per PEP 263, otherwise UTF-8); invalid bytes are decoded as Latin-1, which keeps them distinct, and reported through `D01`.
 
 **Policy modes (`consequence.mode`, `--consequence-mode`, the Action's `consequence-mode` input, or `PAYLOADGUARD_CONSEQUENCE_MODE`):** `shadow` (default — findings are reported in JSON, CLI, Markdown and SARIF without altering the legacy L3 verdict), `advisory` (BLOCK/REVIEW findings become verdict flags and raise SAFE to REVIEW; never exit 2), `enforce` (any BLOCK finding sets DESTRUCTIVE, exit 2; REVIEW findings raise SAFE to REVIEW; a legacy L4 CRITICAL is suppressed when parsing is complete and the SCG finds only renames and moves).
 
@@ -537,7 +544,7 @@ Unlike L1–L4, L5b verdict escalation operates on the pre-existing verdict rath
 
 ## 5. Scoring Model
 
-Layer 3 accumulates a `severity_score` across independent dimensions. No single signal can produce a false positive at default thresholds. DESTRUCTIVE requires either a combination of signals or a single high-confidence signal (security file deletion or structural CRITICAL).
+Layer 3 accumulates a `severity_score` across independent dimensions. No single signal can produce a false positive at default thresholds. DESTRUCTIVE requires either a combination of signals or a single high-confidence signal (security file deletion or structural CRITICAL). Branch age is not evidence of destruction: it can raise a verdict to REVIEW or CAUTION but never decides DESTRUCTIVE.
 
 ### 5.1 Signal Dimensions
 
@@ -548,6 +555,8 @@ Layer 3 accumulates a `severity_score` across independent dimensions. No single 
 | days_old > 365 | +3 |
 | days_old > 180 | +2 |
 | days_old > 90 | +1 |
+
+Branch age is applied after every other signal. When those signals total 5 or more it adds in full; otherwise it raises the score at most to 4, so age can lift a verdict to REVIEW or CAUTION but never decides DESTRUCTIVE (POST-15/16, Z3 P11; `AUDIT_LOG.md` §H1).
 
 **Deletion dimensions (files, ratio, lines)**
 
@@ -685,9 +694,9 @@ external tools run the checks.
 
 | Method | Tool | Scope | What it proves |
 |--------|------|-------|----------------|
-| SMT proof | Z3 Solver | L3, L2c | P1–P10: abstract symbolic properties of the scoring model (P9 derives the score bound from the per-signal model) |
-| Contract verification | CrossHair | L3, L4, L5a, L5b | C1–C12 + POST-12, S1–S7, T1–T7, M1–M9: pre/post conditions on pure-Python mirrors of the scoring code |
-| Machine-checked proof | Dafny 4.9.1 | L3, L4, L5a | POST-1–12, S1–S7, T1–T8 over the entire input domain |
+| SMT proof | Z3 Solver | L3, L2c | P1–P11: abstract symbolic properties of the scoring model (P9 derives the score bound from the per-signal model; P11 proves branch age never decides DESTRUCTIVE) |
+| Contract verification | CrossHair | L3, L4, L5a, L5b | C-01–C-15, S1–S7, T1–T7, M1–M11: pre/post conditions on pure-Python mirrors of the scoring code |
+| Machine-checked proof | Dafny 4.9.1 | L3, L4, L5a | POST-1–12, POST-15/16, S1–S7, T1–T8 over the entire input domain |
 
 **Z3 proofs** (`tests/proofs/test_z3_properties.py`) encode the L3 scoring logic as integer
 constraints and prove monotonicity, score bounds, and verdict ordering. Run in < 0.1 s each.
@@ -722,8 +731,8 @@ crosshair check semantic_pure    --analysis_kind PEP316 --per_condition_timeout 
 pytest tests/proofs/ -v --timeout=60
 ```
 
-Expected: all CrossHair checks exit 0 (no counterexamples) and the 19 pytest proof tests pass.
-Last runs (2026-10-26): Dafny in GitHub Actions (run #16, 9 verified, 0 errors); Z3 and CrossHair
+Expected: all CrossHair checks exit 0 (no counterexamples) and the 25 pytest proof tests pass.
+Last runs (2026-10-27): Dafny in GitHub Actions (run #19, 11 verified, 0 errors); Z3 and CrossHair
 locally. Results and environment are recorded in `PROOFS.md`.
 
 ### 6.4 Constraint
@@ -770,10 +779,10 @@ The harness CI pins the analyser by commit SHA (currently `6c3df91389be550457d50
 | T11 | multilang/structural-js-ts-go | multilang | DESTRUCTIVE | Structural deletions across JS/TS/Go |
 | A01 | adversarial/keyword-evasion | adversarial | DESTRUCTIVE | Destructive diff without benign trigger keywords |
 | A02 | adversarial/rename-smuggling | adversarial | DESTRUCTIVE | auth.py renamed to identity.py, contents gutted |
-| A03 | adversarial/slow-deletion | adversarial | DESTRUCTIVE | 1 function removed from each of 5 files |
+| A03 | adversarial/slow-deletion | adversarial | SAFE | 1 function removed from each of 5 files — below the L3 thresholds; the consequence engine flags it in `enforce` mode |
 | A04 | adversarial/addition-camouflage | adversarial | DESTRUCTIVE | 300-line api.js addition + auth.py deleted |
 | A05 | adversarial/nested-gutting | adversarial | DESTRUCTIVE | Auth class shell preserved, all methods deleted |
-| A06 | adversarial/threshold-gaming | adversarial | DESTRUCTIVE | Every metric just below individual threshold |
+| A06 | adversarial/threshold-gaming | adversarial | SAFE | Every metric just below individual threshold — the consequence engine flags it in `enforce` mode |
 | A07 | adversarial/new-file-replacement | adversarial | DESTRUCTIVE | auth.py deleted + auth_v2.py stub added |
 | A09 | adversarial/config-only-deletion | adversarial | DESTRUCTIVE | settings.yml + requirements.txt deleted |
 | A10 | adversarial/unicode-payload | adversarial | SAFE | Hostile Unicode in comments, +4/-1 lines |
@@ -784,7 +793,7 @@ The harness CI pins the analyser by commit SHA (currently `6c3df91389be550457d50
 |---|---|---|---|---|
 | WS01 | workflow-security/base64-payload | workflow-security | DESTRUCTIVE | `base64_payload` CRITICAL |
 | WS02 | workflow-security/credential-harvest | workflow-security | DESTRUCTIVE | `credential_harvest` CRITICAL |
-| WS03 | workflow-security/dormant-trigger | workflow-security | DESTRUCTIVE | `dormant_trigger_with_payload` HIGH + L2b shell pattern |
+| WS03 | workflow-security/dormant-trigger | workflow-security | CAUTION | `dormant_trigger_with_payload` HIGH |
 | WS04 | workflow-security/forged-bot-author | workflow-security | CAUTION | `forged_bot_author` HIGH |
 | WS05 | workflow-security/oidc-elevation | workflow-security | CAUTION | `oidc_elevation_no_consumer` HIGH |
 | WS06 | workflow-security/prt-write-permissions | workflow-security | DESTRUCTIVE | `pull_request_target_with_write_permissions` CRITICAL |
@@ -796,7 +805,7 @@ The harness CI pins the analyser by commit SHA (currently `6c3df91389be550457d50
 |---|---|---|---|---|
 | AW01 | adversarial/workflow-yaml-folded-block | adversarial | DESTRUCTIVE | Folded block base64 → `base64_payload` CRITICAL |
 | AW02 | adversarial/workflow-prt-only | adversarial | CAUTION | `dangerous_trigger_pull_request_target` HIGH only |
-| AW03 | adversarial/workflow-typosquatted-oidc | adversarial | CAUTION | Typosquat rejected; `oidc_elevation_no_consumer` HIGH |
+| AW03 | adversarial/workflow-typosquatted-oidc | adversarial | DESTRUCTIVE | Typosquatted consumer → `oidc_elevation_typosquatted` CRITICAL |
 | AW04 | adversarial/workflow-legitimate-oidc | adversarial | SAFE | Exact-match allowlist passes — no false positive |
 | AW05 | adversarial/workflow-modified-poison | adversarial | DESTRUCTIVE | M-type diff scanned; `credential_harvest` CRITICAL |
 
@@ -804,7 +813,7 @@ The harness CI pins the analyser by commit SHA (currently `6c3df91389be550457d50
 
 | ID | Branch | Category | Expected | Signal / Notes |
 |---|---|---|---|---|
-| RTA01 | rta/push-rm-rf | red-team | REVIEW | `rm -rf` in workflow — caught by L2 content scanner |
+| RTA01 | rta/push-rm-rf | red-team | CAUTION | Inline `on: workflow_dispatch` + `rm -rf` → `dormant_trigger_with_payload` HIGH. REVIEW through the L2 content scanner until v1.2.0 made L2c the only workflow scanner; the inline trigger was missed until §H2 |
 | RTA02 | rta/schedule-curl-exfil | red-team | DESTRUCTIVE | **Fixed** — `_normalize_yaml_content()` now applied to credential_harvest loop; backslash-continuation lines collapse to spaces before matching |
 | RTA03 | rta/prt-untrusted-checkout | red-team | CAUTION | `pull_request_target` + untrusted `head.sha` checkout — caught by L2c `dangerous_trigger_pull_request_target` HIGH |
 | RTA04 | rta/github-env-injection | red-team | CAUTION | PATH/LD_PRELOAD/NODE_OPTIONS poisoning via `$GITHUB_ENV` — caught by L2c Signal 7 (`github_env_injection`) HIGH |
@@ -965,9 +974,9 @@ For repositories with complex merge histories, `merge_base()` may return multipl
 
 Layer 5b v2 uses structural heuristics rather than keyword lists, but coverage remains bounded by what can be inferred from description text and diff structure alone.
 
-*Unspecified scope descriptions* ("updates config", "changes handler behaviour") produce no micro or macro scope classification. None of the five MCI signals fire without a scope classification (V_s, V_o, V_f, V_e all require micro scope; V_r requires a remedial operation claim). A sufficiently vague description yields TRANSPARENT regardless of diff severity — the layer cannot penalise what it cannot classify.
+*Unspecified scope descriptions* ("updates config", "changes handler behaviour") produce no micro or macro scope classification. None of the five MCI signals fire without a micro or documentation claim (all five require it; V_r also requires a remedial operation claim and churn above the limit). A sufficiently vague description yields TRANSPARENT regardless of diff severity — the layer cannot penalise what it cannot classify.
 
-*V_r false positives on greenfield additions* — a PR claiming "fix" that adds a new module from scratch will have a high insertion ratio and trigger `phantom_additions`. This may be a valid description ("fix the gap by adding X") rather than deception. The signal is advisory at mci_score 0.4 (CAUTION_MISMATCH) unless combined with another signal.
+*V_r scope* — `phantom_additions` fires only with a micro claim and churn above the limit, so it always accompanies `scope_understated` and lifts a "minor fix" that adds a large amount of code to DECEPTIVE_PAYLOAD. Without the micro requirement it fired on ordinary bug fixes that add code (17 of 294 real commits; AUDIT_LOG SEM-02).
 
 *V_f acknowledgement check* uses the last two path components (e.g. `auth_handler.py` for `src/auth_handler.py`). The full filename including extension must appear in the description to suppress the signal — stem-only references ("auth_handler" without ".py") are not recognised as acknowledgement.
 

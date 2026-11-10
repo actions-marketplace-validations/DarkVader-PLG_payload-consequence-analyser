@@ -2,7 +2,7 @@
 
 **Purpose:** This document is the authoritative specification for external verification of PayloadGuard's scoring model. It was produced by reading the source code and is intended for use by an independent verifier — human auditor, CrossHair, Nagini, or Dafny — without relying on any tests or proofs written by the same author as the code.
 
-**Version pinned:** commit `257d1f3` (branch `claude/general-conversation-klxctt` — Sprint 1, L2d AI Config Poisoning). Still current at v1.6.0 (`6c3df91`): `_assess_consequence()` is unchanged since that commit (checked 2026-10-26).  
+**Version pinned:** commit `257d1f3` (branch `claude/general-conversation-klxctt` — Sprint 1, L2d AI Config Poisoning). Still current at v1.6.0 (`6c3df91`): `_assess_consequence()` is unchanged since that commit (checked 2026-10-26). Changed since: §H1 (`2bd08af`, POST-15/16) and §V12 (`529014e`: adds the `escalation_score` key, always 0 in L3 output, and reads severity and recommendation from `_VERDICT_BANDS`; status and score unchanged).  
 **Previous pin:** commit `d0541f6cdc1a46b8b05f15bf689bc6f5532bbb48` (branch `claude/oidc-typosquat-detection-UBCOJ`, merged to `main` as PR #63)  
 **Source file:** `analyze.py`  
 **Method:** `PayloadAnalyzer._assess_consequence()`
@@ -11,7 +11,7 @@
 
 ## 1. System Under Verification
 
-`_assess_consequence()` is the sole scoring function for PayloadGuard's Layer 3 Consequence Model. It receives signal counts from all upstream layers (L1 surface scan, L2 forensic analysis, L2b SCA, L2c actions poisoning, L4 structural drift) and produces a verdict. No other function assigns the final verdict or computes `severity_score`.
+`_assess_consequence()` is the sole scoring function for PayloadGuard's Layer 3 Consequence Model. It receives signal counts from all upstream layers (L1 surface scan, L2 forensic analysis, L2b SCA, L2c actions poisoning, L4 structural drift) and produces the L3 verdict. Later stages can only raise it: the consequence policy (`advisory`, `enforce`) and L5b call `_raise_verdict()`, which sets the new status's severity and recommendation and lifts `severity_score` to the lowest score of its band, recording the lift as `escalation_score` (AUDIT_LOG §V12). Those escalations are outside this specification; `TestEscalatedVerdictFields` in `test_analyzer.py` tests them, and they are not formally verified.
 
 It is a pure function with respect to its arguments: given identical arguments, it always returns the same result. The only external dependency is `self.config.thresholds` — a configuration object whose default values are specified in Section 4.
 
@@ -76,6 +76,12 @@ POST-13:  The internal deletion_dim value ∈ [0, 4] for all inputs
 
 POST-14:  Monotonicity — for any single signal parameter p, holding all other
           parameters constant: increasing p never decreases result["severity_score"]
+
+POST-15:  result["status"] == "DESTRUCTIVE" → content_score ≥ 5
+          (branch age never decides DESTRUCTIVE; content_score is defined in Section 4)
+
+POST-16:  content_score ≤ result["severity_score"] ≤ content_score + age_score(days_old)
+          (branch age never lowers the score and adds at most its tier)
 ```
 
 **POST-4 through POST-7 are exhaustive and mutually exclusive.** Every possible score maps to exactly one verdict. There is no score for which the verdict is undefined.
@@ -151,7 +157,7 @@ structural_score  = 5   if structural_severity == "CRITICAL"   else 0
 crit_file_score   = 2   if critical_file_deletions > 0         else 0
 sec_file_score    = 5   if security_file_deletions > 0         else 0
 sca_score         = 3   if unverified_dependencies > 0         else 0
-content_score     = min(4, content_flags * 2)   if content_flags > 0   else 0
+content_flag_score = min(4, content_flags * 2)   if content_flags > 0   else 0
 
 actions_score     = 5   if actions_poisoning_critical
                   = 3   if (not actions_poisoning_critical) and actions_poisoning_flags > 0
@@ -164,15 +170,18 @@ ai_config_score   = 5   if ai_config_poisoning_critical
 
 ### Total Score and Verdict
 ```
-severity_score = age_score
-               + deletion_dim
+content_score  = deletion_dim
                + structural_score
                + crit_file_score
                + sec_file_score
                + sca_score
-               + content_score
+               + content_flag_score
                + actions_score
                + ai_config_score
+
+severity_score = content_score + age_score             if content_score ≥ 5
+               = min(content_score + age_score, 4)     otherwise
+               (branch age raises the verdict at most to CAUTION; AUDIT_LOG §H1)
 
 verdict(severity_score):
   "DESTRUCTIVE"   if severity_score ≥ 5

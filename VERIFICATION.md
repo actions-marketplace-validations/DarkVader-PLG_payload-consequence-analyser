@@ -2,28 +2,28 @@
 
 Three orthogonal verification methods cover the pure scoring logic across four analysis layers.
 
-**Last runs (2026-10-26):** Dafny 9 verified, 0 errors (GitHub Actions run #16); CrossHair 36 postconditions, 0 counterexamples; Z3 13 tests passed. Results and environments: [`PROOFS.md`](PROOFS.md).
+**Last runs (2026-10-27):** Dafny 11 verified, 0 errors (GitHub Actions run #19, after the §H1 fix); CrossHair 40 postconditions, 0 counterexamples (`consequence_pure` re-run 2026-10-27 after the §H1 fix); Z3 18 tests passed (2026-10-27). Results and environments: [`PROOFS.md`](PROOFS.md).
 
 ### CrossHair Symbolic Execution (Phase 2)
 
 | Layer | Function | Module | Contracts |
 |-------|----------|--------|-----------|
-| L3 Consequence | `_assess_consequence()` | `verification/consequence_pure.py` | C1–C13 |
+| L3 Consequence | `_assess_consequence()` | `verification/consequence_pure.py` | C-01–C-15 |
 | L4 Structural | `analyze_structural_drift()` | `verification/structural_pure.py` | S1–S7 |
 | L5a Temporal | `analyze_drift()` | `verification/temporal_pure.py` | T1–T7 |
-| L5b Semantic | `analyze_transparency()` phase 3 | `verification/semantic_pure.py` | M1–M9 |
+| L5b Semantic | `analyze_transparency()` phase 3 | `verification/semantic_pure.py` | M1–M11 |
 
 ### Z3 SMT Proofs (Phase 1)
 
 | Method | Tool | File | What it proves |
 |--------|------|------|----------------|
-| SMT proof | Z3 Solver | `tests/proofs/test_z3_properties.py` | P1–P10: signal→score→verdict properties (monotonicity, ordering, bijection) |
+| SMT proof | Z3 Solver | `tests/proofs/test_z3_properties.py` | P1–P11: signal→score→verdict properties (monotonicity, ordering, bijection; branch age never decides DESTRUCTIVE) |
 
 ### Dafny Machine-Checked Proofs (Phase 4)
 
 | Layer | Dafny method | File | Postconditions |
 |-------|-------------|------|----------------|
-| L3 Consequence | `AssessConsequence` | `verification/dafny/assess_consequence.dfy` | POST-1–12 (score bounds, verdict bijection, safety implications, empty-input guarantee) |
+| L3 Consequence | `AssessConsequence` | `verification/dafny/assess_consequence.dfy` | POST-1–12, POST-15/16 (score bounds, verdict bijection, safety implications, empty-input guarantee, branch age never decides DESTRUCTIVE) |
 | L4 Structural | `AssessStructuralDrift` | `verification/dafny/structural_drift.dfy` | S1–S7 (dual-gate biconditional) |
 | L5a Temporal | `AnalyzeTemporalDrift` | `verification/dafny/temporal_drift.dfy` | T1–T8 (linear drift, zero-input guarantees) |
 
@@ -49,7 +49,7 @@ no GitPython, no AST parsing, no file I/O.
 
 ---
 
-### Layer 3 — Consequence Scoring (C1–C13)
+### Layer 3 — Consequence Scoring (C-01–C-15)
 
 **Target:** `PayloadAnalyzer._assess_consequence()` → `verification/consequence_pure.py`
 
@@ -84,6 +84,12 @@ no GitPython, no AST parsing, no file I/O.
 | C-11 | `all-zero inputs -> SAFE` | Empty PRs never produce a false positive |
 | C-12 | `deletion_dim in [0, 4]` | Aggregated deletion dimension always capped at 4 |
 | C-13 | `ai_config_poisoning_critical -> DESTRUCTIVE` | Critical AI config poisoning → DESTRUCTIVE |
+| C-14 | `DESTRUCTIVE -> content_score >= 5` (POST-15) | Branch age never decides DESTRUCTIVE (§H1) |
+| C-15 | `content_score <= severity_score <= content_score + age_score` (POST-16) | Branch age never lowers the score and adds at most its tier |
+
+`content_score` is every signal except branch age (`_content_score()`); `age_score` is the branch age tier (`_age_score()`).
+
+**Scope:** these contracts cover the L3 verdict. The consequence policy (`advisory`, `enforce`) and L5b can raise it afterwards through `_raise_verdict()`, which keeps the final verdict in the score bands of C-04–C-07 and records the points added as `escalation_score` (AUDIT_LOG §V12). That step is tested over the L3 signal grid (`TestEscalatedVerdictFields` in `test_analyzer.py`), not formally verified.
 
 ---
 
@@ -148,7 +154,7 @@ where a single deletion produces a high ratio.
 
 ---
 
-### Layer 5b — Semantic MCI Cross-Correlation (M1–M9)
+### Layer 5b — Semantic MCI Cross-Correlation (M1–M11)
 
 **Target:** `SemanticTransparencyAnalyzer.analyze_transparency()` Phase 3 → `verification/semantic_pure.py`
 
@@ -184,6 +190,10 @@ description — abstracted as `has_unacknowledged_sensitive: bool`.
 | M-07 | `DECEPTIVE_PAYLOAD -> mci_score >= 0.5` | DECEPTIVE_PAYLOAD is only produced by score ≥ 0.5 |
 | M-08 | `TRANSPARENT -> mci_score == 0.0` | TRANSPARENT verdict always has zero MCI |
 | M-09 | `TRANSPARENT -> not is_macro` | Macro-scope claims are never fully transparent |
+| M-10 | `not is_micro -> mci_score == 0.0` | Only a claim of a small (or documentation) change can score; an ordinary description is never a mismatch (AUDIT_LOG SEM-02) |
+| M-11 | `total_churn <= churn_limit and structural_alterations == 0 and not has_unacknowledged_sensitive and ext_count < 3 -> mci_score == 0.0` | A change within the micro limits never scores, whatever the claim |
+
+A documentation claim ("docs", "readme", "changelog") reaches the model as `is_micro` with the profile of the files outside documentation (Phase 2). `tests/proofs/test_crosshair_contracts.py` checks, without CrossHair, that the model returns production's status and score on a 63-case grid of descriptions and diffs.
 
 ---
 
@@ -233,7 +243,7 @@ CI runs Dafny automatically on any PR touching `verification/dafny/**` via `.git
 
 ```bash
 pytest tests/proofs/ -v --timeout=60
-# Expected: 19 passed (13 Z3 tests + 5 CrossHair wrappers + 1 temporal contract regression)
+# Expected: 25 passed (18 Z3 tests + 7 CrossHair-file tests: 5 contract wrappers, the temporal contract regression and the L3 model parity test)
 ```
 
 ---

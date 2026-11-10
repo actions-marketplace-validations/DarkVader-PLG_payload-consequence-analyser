@@ -1,10 +1,10 @@
 # PayloadGuard — Test Run Report
 
-**Date:** 2026-10-26 16:00 UTC  
+**Date:** 2026-10-29 20:35 UTC  
 **Environment:** Python 3.14.3, pytest 9.1.1, z3-solver 5.3.2.0, crosshair-tool 0.0.112, tree-sitter 0.26.0  
 **Platform:** Windows 11 (local)  
-**Commit:** `28345bc`  
-**Result:** 391 passed · 0 skipped · 0 failed
+**Commit:** `da16490`  
+**Result:** 513 passed · 0 skipped · 0 failed
 
 Run with: `python -m pytest test_analyzer.py test_consequence_engine.py tests/ -v`
 
@@ -79,7 +79,7 @@ Run with: `python -m pytest test_analyzer.py test_consequence_engine.py tests/ -
 
 ## test_analyzer.py::TestAssessConsequenceDestructive
 
-- ✓ `test_branch_over_365_days_and_many_files`
+- ✓ `test_branch_over_365_days_and_security_deletion`
 - ✓ `test_combined_flags_score`
 - ✓ `test_high_deletion_ratio_and_line_count`
 - ✓ `test_recommendation_says_do_not_merge`
@@ -96,6 +96,31 @@ Run with: `python -m pytest test_analyzer.py test_consequence_engine.py tests/ -
 
 - ✓ `test_custom_age_threshold_fires_earlier`
 - ✓ `test_custom_files_threshold`
+
+## test_analyzer.py::TestBranchAgeCannotDecideDestructive
+
+- ✓ `test_age_adds_to_destructive_content`
+- ✓ `test_age_does_not_lift_caution_content_to_destructive`
+- ✓ `test_age_does_not_lift_review_content_to_destructive`
+- ✓ `test_age_never_decides_destructive_across_signal_grid`
+- ✓ `test_age_still_escalates_safe_content`
+- ✓ `test_mass_deletion_on_old_branch_matches_fresh_branch`
+
+## test_analyzer.py::TestBranchAgeSemanticEscalation
+
+- ✓ `test_deception_on_age_only_caution_stays_caution`
+- ✓ `test_deception_on_content_caution_escalates_to_destructive`
+
+## test_analyzer.py::TestEscalatedVerdictFields
+
+- ✓ `test_deception_on_age_only_caution_keeps_status_and_score`
+- ✓ `test_deception_on_clean_change_reports_caution`
+- ✓ `test_deception_on_content_caution_reports_destructive`
+- ✓ `test_l3_fields_keep_their_values`
+- ✓ `test_missing_description_reports_review`
+- ✓ `test_raise_keeps_a_score_already_in_band`
+- ✓ `test_raise_lifts_score_to_lowest_score_of_new_band`
+- ✓ `test_semantic_escalation_across_signal_grid`
 
 ## test_analyzer.py::TestPayloadAnalyzerInit
 
@@ -251,10 +276,15 @@ Run with: `python -m pytest test_analyzer.py test_consequence_engine.py tests/ -
 
 - ✓ `test_load_allowlist_returns_none_when_absent`
 - ✓ `test_load_allowlist_returns_sets`
+- ✓ `test_npm_added_packages_compares_entries`
+- ✓ `test_npm_added_packages_overrides_and_resolutions`
+- ✓ `test_npm_added_packages_reads_dependency_sections_only`
+- ✓ `test_npm_added_packages_returns_none_when_unparseable`
 - ✓ `test_parse_cargo_package`
 - ✓ `test_parse_go_package`
 - ✓ `test_parse_ignores_diff_header_line`
 - ✓ `test_parse_npm_package`
+- ✓ `test_parse_npm_section_key_is_not_a_package`
 - ✓ `test_parse_pip_ignores_removed_lines`
 - ✓ `test_parse_pip_packages`
 - ✓ `test_sca_inactive_without_allowlist`
@@ -310,6 +340,7 @@ Run with: `python -m pytest test_analyzer.py test_consequence_engine.py tests/ -
 - ✓ `test_custom_trusted_oidc_consumer_via_config`
 - ✓ `test_decode_error_does_not_crash`
 - ✓ `test_deleted_workflow_not_scanned`
+- ✓ `test_dormant_trigger_detected_in_every_yaml_layout`
 - ✓ `test_dormant_trigger_with_shell_exec`
 - ✓ `test_dormant_trigger_without_shell_is_safe`
 - ✓ `test_flag_text_appears_in_verdict`
@@ -330,9 +361,11 @@ Run with: `python -m pytest test_analyzer.py test_consequence_engine.py tests/ -
 - ✓ `test_oidc_elevation_without_consumer`
 - ✓ `test_pull_request_target_alone_is_detected`
 - ✓ `test_pull_request_target_with_write_permissions_is_critical`
+- ✓ `test_push_only_trigger_is_not_dormant`
 - ✓ `test_typosquat_detection_patterns`
 - ✓ `test_typosquatted_oidc_action_detected_as_critical`
 - ✓ `test_typosquatted_oidc_action_fails_legitimacy_check`
+- ✓ `test_unparseable_workflow_keeps_line_pattern_detection`
 - ✓ `test_yaml_folded_block_base64_detected`
 - ✓ `test_yaml_literal_block_base64_detected`
 
@@ -340,6 +373,11 @@ Run with: `python -m pytest test_analyzer.py test_consequence_engine.py tests/ -
 
 - ✓ `test_caution_mismatch_escalates_safe_to_review`
 - ✓ `test_deceptive_payload_escalates_safe_to_caution`
+- ✓ `test_docs_claim_hiding_a_sensitive_file_is_flagged`
+- ✓ `test_docs_claim_measures_code_outside_documentation`
+- ✓ `test_docs_claim_on_documentation_only_is_transparent`
+- ✓ `test_docs_claim_with_small_named_code_change_is_transparent`
+- ✓ `test_domain_words_are_not_size_claims`
 - ✓ `test_is_deceptive_true_on_deceptive_payload_status`
 - ✓ `test_is_deceptive_true_only_on_deceptive_payload`
 - ✓ `test_macro_scope_large_diff_adds_advisory_not_mci_penalty`
@@ -347,6 +385,8 @@ Run with: `python -m pytest test_analyzer.py test_consequence_engine.py tests/ -
 - ✓ `test_matched_keyword_is_first_signal_or_none`
 - ✓ `test_matched_keyword_none_when_no_signals`
 - ✓ `test_mci_score_clamped_at_1_0`
+- ✓ `test_micro_fix_within_churn_limit_is_not_phantom`
+- ✓ `test_micro_remedial_claim_high_insertion_ratio_flags_phantom`
 - ✓ `test_micro_scope_auth_file_acknowledged_in_description_ok`
 - ✓ `test_micro_scope_auth_file_unacknowledged_flags`
 - ✓ `test_micro_scope_large_churn_flags_scope_understated`
@@ -355,11 +395,12 @@ Run with: `python -m pytest test_analyzer.py test_consequence_engine.py tests/ -
 - ✓ `test_micro_scope_three_extensions_flags_cross_stack`
 - ✓ `test_micro_scope_with_new_def_flags_operation_mutation`
 - ✓ `test_no_description_returns_unverified`
+- ✓ `test_plain_fix_claim_on_additions_is_transparent`
 - ✓ `test_remedial_claim_balanced_ratio_transparent`
-- ✓ `test_remedial_claim_high_insertion_ratio_flags_phantom`
 - ✓ `test_result_contains_required_keys`
 - ✓ `test_score_at_0_5_returns_deceptive_payload`
 - ✓ `test_score_below_0_5_returns_caution_mismatch`
+- ✓ `test_text_and_config_files_under_docs_are_not_documentation`
 - ✓ `test_transparent_with_no_signals_returns_transparent`
 - ✓ `test_two_signals_accumulate_correctly`
 - ✓ `test_unverified_result_contains_required_keys`
@@ -404,6 +445,10 @@ Run with: `python -m pytest test_analyzer.py test_consequence_engine.py tests/ -
 - ✓ `test_cursor_rule_alwaysapply_without_exec_is_safe`
 - ✓ `test_full_scan_detects_claude_session_hook`
 - ✓ `test_gemini_settings_session_hook_critical`
+- ✓ `test_hidden_characters_are_flagged`
+- ✓ `test_leading_byte_order_mark_is_not_flagged`
+- ✓ `test_plain_ascii_is_not_hidden_unicode`
+- ✓ `test_regex_matches_only_the_intended_code_points`
 - ✓ `test_vscode_tasks_folder_open_critical`
 - ✓ `test_vscode_tasks_no_folder_open_is_safe`
 - ✓ `test_zero_ai_config_inputs_still_safe`
@@ -416,8 +461,10 @@ Run with: `python -m pytest test_analyzer.py test_consequence_engine.py tests/ -
 
 ## test_analyzer.py::TestPolicyReadFromTargetBranch
 
+- ✓ `test_advisory_review_carries_review_recommendation`
 - ✓ `test_cli_flag_takes_precedence_over_env_mode`
 - ✓ `test_control_destructive_change_blocks_under_base_policy`
+- ✓ `test_enforce_block_reports_destructive_fields`
 - ✓ `test_env_mode_still_overrides_policy_file`
 - ✓ `test_legitimate_change_passes_under_base_policy`
 - ✓ `test_load_config_ref_reads_commit_not_working_tree`
@@ -529,14 +576,117 @@ Run with: `python -m pytest test_analyzer.py test_consequence_engine.py tests/ -
 - ✓ `test_d08_first_party_actions_not_flagged_as_unpinned`
 - ✓ `test_d06_nonlocal_inner_function_mutation_not_flagged_as_short_circuit`
 
+## test_consequence_engine.py::TestRound3RenameActivation
+
+- ✓ `test_rename_into_claude_settings_is_scanned`
+- ✓ `test_rename_between_inactive_paths_is_not_flagged`
+- ✓ `test_rename_into_workflow_directory_is_scanned`
+- ✓ `test_rename_within_workflow_directory_keeps_base_for_d08`
+- ✓ `test_rename_into_makefile_is_build_wrapper_tampering`
+- ✓ `test_rename_into_migrations_reports_drop`
+- ✓ `test_npm_manifest_renamed_from_template_is_scanned_in_full`
+- ✓ `test_active_base_source_rules`
+
+## test_consequence_engine.py::TestRound3SymlinkTypeChange
+
+- ✓ `test_regular_file_to_symlink_is_analysed_through_target`
+- ✓ `test_symlink_retarget_is_reported`
+- ✓ `test_unresolvable_symlink_is_incomplete_analysis`
+- ✓ `test_added_symlink_is_not_a_type_change`
+
+## test_consequence_engine.py::TestRound3BuildActivation
+
+- ✓ `test_uncommented_recipe_is_tampering`
+- ✓ `test_command_inside_a_longer_base_line_is_new_when_bare`
+- ✓ `test_unchanged_active_and_commented_lines_are_not_flagged`
+- ✓ `test_automatic_npm_hooks_are_reported[prepack]`
+- ✓ `test_automatic_npm_hooks_are_reported[postpack]`
+- ✓ `test_automatic_npm_hooks_are_reported[prepublishOnly]`
+- ✓ `test_automatic_npm_hooks_are_reported[dependencies]`
+- ✓ `test_automatic_npm_hooks_are_reported[preinstall]`
+- ✓ `test_named_npm_script_is_not_a_lifecycle_hook`
+- ✓ `test_valid_json_of_unexpected_shape_does_not_abort[.vscode/tasks.json-{"version": "2.0.0", "tasks": [{"label": "x", "runOptions": null}]}]`
+- ✓ `test_valid_json_of_unexpected_shape_does_not_abort[.vscode/tasks.json-{"tasks": 5}]`
+- ✓ `test_valid_json_of_unexpected_shape_does_not_abort[.claude/settings.json-[]]`
+- ✓ `test_valid_json_of_unexpected_shape_does_not_abort[.claude/settings.json-{"hooks": {"SessionStart": [{"hooks": 5}]}}]`
+- ✓ `test_valid_json_of_unexpected_shape_does_not_abort[package.json-[]]`
+- ✓ `test_valid_json_of_unexpected_shape_does_not_abort[composer.json-null]`
+- ✓ `test_valid_json_of_unexpected_shape_does_not_abort[mcp.json-["server"]]`
+
+## test_consequence_engine.py::TestRound3GuardRegressions
+
+- ✓ `test_guard_case[SEC01 swallowed]`
+- ✓ `test_guard_case[SEC02 rethrown]`
+- ✓ `test_guard_case[SEC03 write first]`
+- ✓ `test_guard_case[SEC04 log first]`
+- ✓ `test_guard_case[SEC06 optional]`
+- ✓ `test_guard_case[SEC07 required]`
+- ✓ `test_guard_case[SEC08 is False]`
+- ✓ `test_guard_case[SEC10 helper]`
+- ✓ `test_guard_case[SEC11 no-op helper]`
+- ✓ `test_guard_case[SEC12 lazy]`
+- ✓ `test_guard_case[SEC13 consumed]`
+- ✓ `test_guard_case[SEC14 or to and]`
+- ✓ `test_guard_case[SEC15 reordered]`
+- ✓ `test_guard_case[SEC19 discarded]`
+- ✓ `test_guard_case[SEC20 assigned]`
+- ✓ `test_guard_case[both branches]`
+- ✓ `test_guard_case[branch given another guard]`
+- ✓ `test_guard_case[condition in new terms]`
+- ✓ `test_guard_case[conditionally called helper]`
+- ✓ `test_guard_case[early return of nothing]`
+- ✓ `test_guard_case[early return with effect]`
+- ✓ `test_guard_case[lambda called later]`
+- ✓ `test_guard_case[predicate helper denies]`
+- ✓ `test_guard_case[predicate helper ignores]`
+- ✓ `test_guard_case[read moved first]`
+- ✓ `test_guard_case[state clause moved to helper]`
+- ✓ `test_guard_case[state clause weakened in helper]`
+- ✓ `test_guard_case[suppress()]`
+- ✓ `test_guard_case[swallowing helper]`
+- ✓ `test_helper_in_unchanged_file_is_resolved`
+- ✓ `test_ambiguous_helper_must_enforce_in_every_definition`
+- ✓ `test_execution_facts`
+
+## test_consequence_engine.py::TestRound3CallerIndexCoverage
+
+- ✓ `test_caller_beyond_budget_is_reported_as_unchecked`
+- ✓ `test_referencing_files_are_indexed_first`
+- ✓ `test_complete_index_is_available_without_note`
+- ✓ `test_unparsed_indexed_file_is_reported`
+- ✓ `test_unparsed_index_without_api_change_is_not_a_finding`
+- ✓ `test_head_parse_error_survives_identical_base_error`
+- ✓ `test_base_only_parse_error_stays_a_warning`
+- ✓ `test_git_grep_finds_caller_past_the_budget`
+
+## test_consequence_engine.py::TestRound3SourceEncoding
+
+- ✓ `test_decode_source`
+- ✓ `test_decode_errors_mark_the_parse_incomplete`
+- ✓ `test_declared_latin1_rename_is_a_rename`
+- ✓ `test_undeclared_latin1_python_is_a_head_parse_error`
+
+## test_consequence_engine.py::TestRound3SemanticChurn
+
+- ✓ `test_micro_claim_on_large_change_is_deceptive`
+- ✓ `test_accurate_description_is_transparent`
+- ✓ `test_added_declarations_are_counted`
+
+## test_consequence_engine.py::TestRound3PackageManifest
+
+- ✓ `test_approved_dependency_is_clean_and_safe`
+- ✓ `test_unapproved_dependency_is_the_only_flag`
+
 ## tests/proofs/test_crosshair_contracts.py
 
 - ✓ `test_crosshair_deletion_dim_contracts`
 - ✓ `test_crosshair_assess_consequence_contracts`
 - ✓ `test_crosshair_temporal_drift_contracts`
 - ✓ `test_temporal_contract_excludes_non_finite_velocity`
+- ✓ `test_consequence_model_matches_production_and_contracts`
 - ✓ `test_crosshair_structural_drift_contracts`
 - ✓ `test_crosshair_semantic_mci_contracts`
+- ✓ `test_semantic_model_matches_production_and_contracts`
 
 ## tests/proofs/test_z3_properties.py
 
@@ -553,3 +703,8 @@ Run with: `python -m pytest test_analyzer.py test_consequence_engine.py tests/ -
 - ✓ `test_p9_bound_depends_on_signal_caps`
 - ✓ `test_p9_model_matches_assess_consequence`
 - ✓ `test_p10_empty_signal_set_always_safe`
+- ✓ `test_p11_branch_age_never_decides_destructive`
+- ✓ `test_p11_age_never_lowers_score_and_adds_at_most_its_tier`
+- ✓ `test_p11_age_still_raises_score_below_destructive`
+- ✓ `test_p11_depends_on_age_cap`
+- ✓ `test_p11_model_matches_assess_consequence`
